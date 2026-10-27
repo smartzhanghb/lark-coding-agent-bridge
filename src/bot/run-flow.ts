@@ -1,3 +1,4 @@
+import { selectedWorkspace, generationFingerprint } from '../workspace/selection';
 import type { AgentCapability } from '../agent/capability';
 import { resolveModelArg } from '../agent/models';
 import type { AgentEvent } from '../agent/types';
@@ -35,6 +36,11 @@ export interface StartRunFlowInput {
   executor: RunExecutor;
   now: number;
   stopGraceMs?: number;
+  ownerDm?: boolean;
+  expectedRunVersion?: number;
+  recheckAccess?: () => AccessDecision;
+  currentProfileConfig?: () => ProfileConfig;
+  onQueued?: (position: number) => void;
   observability?: {
     profile: string;
     agent: string;
@@ -44,6 +50,7 @@ export interface StartRunFlowInput {
 }
 
 export type RunFlowRejectCode =
+  | 'workspace-unbound'
   | WorkingDirectoryRejectReason
   | RunPolicyReject['rejectReason']['code']
   | RunRejectedCode;
@@ -72,11 +79,16 @@ export interface RecordRunSessionEventInput {
   capability: AgentCapability;
   policy: RunPolicyAllow;
   event: AgentEvent;
+  workspaces?: WorkspaceStore;
+  generation?: string;
 }
 
 export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFlowResult> {
-  const requestedCwd =
-    input.workspaces.cwdFor(input.scopeId) ?? input.profileConfig.workspaces.default ?? '';
+  const managed = input.profileConfig.workspaces.managedBindings === true;
+  const runVersion = input.expectedRunVersion ?? input.executor.version(input.scopeId);
+  const generation = input.workspaces.generation(input.scopeId);
+  const requestedCwd = selectedWorkspace({ ...input, scope: input.scopeId }) ?? '';
+  if (managed && !requestedCwd) return { ok: false, rejectReason: { code: 'workspace-unbound', userVisible: '当前聊天未绑定可用项目，请等待机器人所有者绑定或启用工作区。' } };
   const workspace = await resolveWorkingDirectory(requestedCwd);
   if (!workspace.ok) {
     return {
@@ -110,6 +122,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
     };
   }
 
+  if (managed) policy.policyFingerprint = generationFingerprint(policy.policyFingerprint, generation);
   let resumeFrom: string | undefined;
   let sessionId: string | undefined;
   let threadId: string | undefined;
@@ -128,7 +141,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
       resumeFrom = threadId;
     }
   }
-  if (!resumeFrom && input.capability.agentId === 'claude') {
+  if (!resumeFrom && !managed && input.capability.agentId === 'claude') {
     resumeFrom = input.sessions.resumeFor(input.scopeId, workspace.cwdRealpath);
     sessionId = resumeFrom;
     const stale = input.sessions.getRaw(input.scopeId);
@@ -142,6 +155,21 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
     execution = await input.executor.submit({
       scopeId: input.scopeId,
       policy,
+      serializeDirectory: managed,
+      onQueued: input.onQueued,
+      beforeSpawn: managed ? async () => {
+        if (runVersion !== input.executor.version(input.scopeId)) throw new RunRejected('cancelled', '任务已取消');
+        if (generation !== input.workspaces.generation(input.scopeId)) throw new RunRejected('binding-changed', '工作区或会话已变化，旧任务已取消，请重新发送');
+        const cwd = selectedWorkspace({ ...input, scope: input.scopeId });
+        const latest = cwd ? await resolveWorkingDirectory(cwd) : undefined;
+        if (!latest?.ok || latest.cwdRealpath !== workspace.cwdRealpath) throw new RunRejected('binding-changed', '工作区已失效，任务未执行');
+        const currentProfile = input.currentProfileConfig?.() ?? input.profileConfig;
+        const next = evaluateRunPolicy({ ...input, profileConfig: currentProfile, requestedCwd, cwdRealpath: workspace.cwdRealpath, access: input.recheckAccess?.() ?? input.access, now: Date.now(), codexHome: currentProfile.codex?.codexHome, inheritCodexHome: currentProfile.codex?.inheritCodexHome });
+        if (runVersion !== input.executor.version(input.scopeId)) throw new RunRejected('cancelled', '任务已取消');
+        if (generation !== input.workspaces.generation(input.scopeId)) throw new RunRejected('binding-changed', '工作区或会话已变化，请重新发送');
+        if (!next.ok || generationFingerprint(next.policyFingerprint, generation) !== policy.policyFingerprint) throw new RunRejected('binding-changed', '访问权限已变化，请重新发送任务');
+        policy.expiresAt = next.expiresAt;
+      } : undefined,
       sessionId,
       threadId,
       model: resolveModelArg(
@@ -165,7 +193,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
         rejectReason: {
           code: err.code,
           userVisible:
-            err.code === 'reconnect-in-progress'
+            err.code === 'binding-changed' || err.code === 'cancelled' ? err.message : err.code === 'reconnect-in-progress'
               ? '当前 bot 正在重连，稍后会继续处理新消息。'
               : err.code === 'run-already-active'
                 ? '当前会话已有运行在执行，请稍后再试或先停止当前运行。'
@@ -188,6 +216,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
 
 export function recordRunSessionEvent(input: RecordRunSessionEventInput): void {
   if (input.event.type !== 'system') return;
+  if (input.workspaces && input.generation !== undefined && input.workspaces.generation(input.scopeId) !== input.generation) return;
   if (input.capability.agentId === 'claude' && input.event.sessionId) {
     const cwdRealpath = input.event.cwd ?? input.policy.cwdRealpath;
     input.sessions.set(input.scopeId, input.event.sessionId, cwdRealpath);

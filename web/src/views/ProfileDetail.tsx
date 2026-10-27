@@ -15,6 +15,7 @@ import {
 } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/sonner";
 import { ConfigView } from "./ConfigView";
+import { WorkspacesView } from "./WorkspacesView";
 
 function uptime(ms: number): string {
   const s = Math.floor(ms / 1000);
@@ -119,6 +120,7 @@ export function ProfileDetail({ profile, onBack }: { profile: string; onBack: ()
         </CardContent>
       </Card>
 
+      <WorkspacesView profile={profile} />
       <ConfigView profile={profile} />
 
       <Dialog open={confirm} onOpenChange={(o) => !o && setConfirm(false)}>

@@ -1,3 +1,5 @@
+> 本仓库增量版本新增会话工作区管理与可靠性保护，操作、兼容和回退说明见 [会话工作区指南](docs/WORKSPACES.md)。
+
 # lark-channel-bridge
 
 把飞书 / Lark 消息和本地 Claude Code 或 Codex CLI 打通的轻量 bot。用一条命令启动，扫码绑定 PersonalAgent 应用，然后在飞书里和本机编程助手对话，让它读图、处理文件、改代码。

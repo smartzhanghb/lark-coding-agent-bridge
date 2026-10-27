@@ -46,6 +46,8 @@ export class PendingQueue {
     return 1;
   }
 
+  scopes(): string[] { return [...new Set([...this.map.keys(), ...this.blocked])]; }
+
   cancel(scope: string): NormalizedMessage[] {
     const entry = this.map.get(scope);
     if (!entry) return [];

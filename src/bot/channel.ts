@@ -1,3 +1,6 @@
+import { stampWorkspaceMessage, workspaceMessageGeneration } from '../workspace/message-context';
+import { affectedScope } from '../workspace/service';
+import { selectedWorkspace } from '../workspace/selection';
 import type {
   LarkChannel,
   LarkChannelOptions,
@@ -255,9 +258,8 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     },
     // SDK 1.65.0-alpha.3+ knobs.
     wsConfig: {
-      // 3s liveness watchdog: if no inbound message arrives within 3s after
-      // the last ping, SDK presumes connection dead and forces a reconnect.
-      pingTimeout: 3,
+      // Tolerate short local network stalls; preserve the host's proven 15s setting.
+      pingTimeout: 15,
     },
     // 8s handshake timeout (replaces hardcoded 15s). Fast-fail + fast-retry
     // beats slow-fail in unstable networks.
@@ -328,6 +330,8 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       }
     });
   });
+  controls.workspaceRuntime = { workspaces, sessions, sessionCatalog, executor, activeRuns, pending, changing: new Set() };
+
 
   // Counter for stdout reconnect escalation; reset on `reconnected`.
   let consecutiveReconnects = 0;
@@ -519,6 +523,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       meetingManager?.dispose();
       controls.meeting = undefined;
       pending.cancelAll();
+      await executor.cancelAll();
       const [disconnectResult, stopAllResult, ...flushResults] = await Promise.allSettled([
         channel.disconnect(),
         activeRuns.stopAll(),
@@ -738,6 +743,14 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     return;
   }
 
+  if (controls.profileConfig.workspaces.managedBindings) {
+    await workspaces.observe({ id: scope, chatId: msg.chatId, type: chatMode, lastActivity: Date.now(), ownerDm: chatMode === 'p2p' && msg.senderId === controls.botOwnerId,
+      name: chatMode === 'p2p' ? msg.senderName || '私聊' : controls.knownChats?.find((c) => c.id === msg.chatId)?.name });
+    if ([...(controls.workspaceRuntime?.changing ?? [])].some((target) => target === '*' || affectedScope(target, scope))) {
+      await channel.send(msg.chatId, { markdown: '正在切换工作区，请稍后重新发送。' }, { replyTo: msg.messageId }); return;
+    }
+  }
+
   // A merge_forward whose sub-messages the SDK could not fetch (transient
   // upstream failure, already retried inside @larksuite/channel) arrives as the
   // fetch_failed sentinel. Feeding it to the agent would read as an empty
@@ -783,6 +796,10 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     return;
   }
 
+  if (controls.profileConfig.workspaces.managedBindings && !selectedWorkspace({ workspaces, profileConfig: controls.profileConfig, scope, ownerDm: chatMode === 'p2p' && msg.senderId === controls.botOwnerId })) {
+    await channel.send(msg.chatId, { markdown: '当前聊天未绑定可用项目，请等待机器人所有者绑定。' }, { replyTo: msg.messageId, ...(threadId ? { replyInThread: true } : {}) }); return;
+  }
+  stampWorkspaceMessage(emsg, `${workspaces.generation(scope)}|${executor.version(scope)}`);
   const size = pending.push(scope, emsg);
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
 }
@@ -828,6 +845,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
 
   const chatId = firstMsg.chatId;
   const threadId = firstMsg.threadId;
+  const generation = workspaces.generation(scope);
+  const runVersion = executor.version(scope);
+  const queuedContext = workspaceMessageGeneration(firstMsg);
+  if (controls.profileConfig.workspaces.managedBindings && queuedContext && queuedContext !== `${generation}|${runVersion}`) return;
 
   const resourceItems = batch.flatMap((m) =>
     m.resources.map((r) => ({ messageId: m.messageId, resource: r })),
@@ -959,6 +980,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     controls.profileConfig.agentKind === 'codex'
       ? codexCapability(controls.profileConfig)
       : claudeCapability(controls.profileConfig);
+  if (controls.profileConfig.workspaces.managedBindings && workspaces.generation(scope) !== generation) return;
   const flow = await startRunFlow({
     scopeId: scope,
     scope: scopeContext,
@@ -972,6 +994,20 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     workspaces,
     executor,
     now: Date.now(),
+    expectedRunVersion: runVersion,
+    currentProfileConfig: () => controls.profileConfig,
+    ownerDm: mode === 'p2p' && firstMsg.senderId === controls.botOwnerId,
+    recheckAccess: () => {
+      if (controls.workspaceRuntime?.changing.size) return { ok: false, reason: 'denied-user' };
+      for (const m of batch) {
+        const access = m.chatType === 'p2p' ? canUseDm(controls.profileConfig, controls, m.senderId) : canUseGroup(controls.profileConfig, controls, m.chatId, m.senderId);
+        if (!access.ok) return access;
+      }
+      return firstMsg.chatType === 'p2p' ? canUseDm(controls.profileConfig, controls, firstMsg.senderId) : canUseGroup(controls.profileConfig, controls, firstMsg.chatId, firstMsg.senderId);
+    },
+    onQueued: controls.profileConfig.workspaces.managedBindings ? (position) => {
+      void channel.send(chatId, { markdown: `项目「${workspaces.selection(scope).project?.name ?? '个人默认工作区'}」：任务已进入队列（当前目录第 ${position} 项）。可用 /stop 取消。` }, sendOpts).catch((err) => log.warn('queue', 'notice-failed', { err: String(err) }));
+    } : undefined,
     stopGraceMs: getAgentStopGraceMs(controls.cfg),
     observability: {
       profile: controls.profile,
@@ -1008,6 +1044,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       capability,
       policy: flow.policy,
       event: evt,
+      workspaces: controls.profileConfig.workspaces.managedBindings ? workspaces : undefined,
+      generation,
     });
     if (evt.type === 'system' && evt.sessionId) {
       log.info('session', 'set', { sessionId: evt.sessionId });

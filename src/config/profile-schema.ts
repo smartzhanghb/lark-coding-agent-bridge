@@ -154,6 +154,7 @@ export interface ProfileConfig {
   preferences: Omit<AppPreferences, 'access' | 'requireMentionInGroup'>;
   access: ProfileAccess;
   workspaces: {
+    managedBindings?: boolean;
     default?: string;
   };
   sandbox: SandboxConfig;
@@ -229,6 +230,7 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
     preferences?: (AppPreferences & { access?: Partial<ProfileAccess> }) | undefined;
     access?: Partial<ProfileAccess>;
     workspaces?: {
+      managedBindings?: unknown;
       default?: unknown;
       // Legacy workspace authorization fields are accepted for config
       // compatibility only; normalizeWorkspaces drops them.
@@ -364,6 +366,7 @@ function normalizeChatMentionMap(input: unknown): Record<string, boolean> {
 }
 
 function normalizeWorkspaces(input: {
+  managedBindings?: unknown;
   default?: unknown;
   trusted?: unknown;
   trustedRoots?: unknown;
@@ -372,7 +375,7 @@ function normalizeWorkspaces(input: {
   const defaultWorkspace = typeof input?.default === 'string' && input.default.trim()
     ? input.default.trim()
     : undefined;
-  return defaultWorkspace ? { default: defaultWorkspace } : {};
+  return { ...(defaultWorkspace ? { default: defaultWorkspace } : {}), ...(input?.managedBindings === true ? { managedBindings: true } : {}) };
 }
 
 function normalizeCodex(input: CodexConfig & { flags?: unknown }): CodexConfig {

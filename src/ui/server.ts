@@ -1,3 +1,4 @@
+import { workspaceView, mutateWorkspace } from './workspaces';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomBytes } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
@@ -130,6 +131,28 @@ async function route(
   const g = method === 'GET';
   const p = method === 'POST';
   const sup = deps.supervisor;
+
+  if (path === '/api/workspaces' && (g || p)) {
+    const { controls } = await resolveTargetState(deps, url);
+    if (!controls) throw new HttpError(409, '请先启动机器人');
+    sendJson(res, 200, g ? await workspaceView(controls) : await mutateWorkspace(controls, await readJsonBody(req)));
+    return;
+  }
+  if (path === '/api/maintenance/restart-if-idle' && p) {
+    const { controls } = await resolveTargetState(deps, url);
+    if (!controls?.workspaceRuntime) throw new HttpError(409, '机器人未运行');
+    const rt = controls.workspaceRuntime;
+    const release = rt.activeRuns.pauseNewRuns('scheduled-maintenance');
+    try {
+      const busy = rt.executor.snapshot().length > 0 || rt.pending.scopes().length > 0 || rt.activeRuns.snapshot().length > 0 || rt.changing.size > 0;
+      if (busy) { sendJson(res, 200, { restarted: false, reason: 'busy' }); return; }
+      // Prevent new intake while the old channel is replaced.
+      rt.changing.add('*');
+      await controls.restart({ wait: true });
+      sendJson(res, 200, { restarted: true });
+    } finally { rt.changing.delete('*'); release(); }
+    return;
+  }
 
   if (path === '/api/status' && g) {
     sendJson(res, 200, {

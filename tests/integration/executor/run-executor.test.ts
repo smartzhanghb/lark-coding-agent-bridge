@@ -259,10 +259,11 @@ describe('RunExecutor', () => {
     await collect(execution.subscribe());
 
     const run = execution.run as FakeAgentRun;
-    expect(run.waitForExitCalls).toBe(1);
+    expect(run.waitForExitCalls).toBe(2);
     expect(run.stopped).toBe(true);
-    expect(h.activeRuns.get('scope-1')).toBeUndefined();
-    expect(h.pool.snapshot()).toMatchObject({ active: 0, waiting: 0 });
+    // An unconfirmed exit must retain its slot; another task cannot overlap it.
+    expect(h.activeRuns.get('scope-1')).toBeDefined();
+    expect(h.pool.snapshot()).toMatchObject({ active: 1, waiting: 0 });
   });
 });
 

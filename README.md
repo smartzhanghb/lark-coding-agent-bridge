@@ -1,3 +1,5 @@
+> This fork adds owner-managed chat workspace bindings and cancellable directory scheduling. See [workspace operations and compatibility](docs/WORKSPACES.md).
+
 # lark-channel-bridge
 
 A lightweight bot that bridges Feishu / Lark messenger with your local Claude Code or Codex CLI. Run one command, scan a QR code to bind a PersonalAgent app, and talk to your local coding agent from chat.

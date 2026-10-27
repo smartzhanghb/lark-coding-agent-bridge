@@ -31,6 +31,13 @@ function shell(title: string, elements: object[]): object {
   };
 }
 
+export function managedWorkspaceCard(summary: string, projects: Array<{ id: string; name: string }>, revision: string): object {
+  const elements: object[] = [divMd(summary)];
+  for (const project of projects) elements.push(actions([{ text: `切换：${project.name}`, value: { cmd: 'ws.bind', arg: project.id, revision }, style: 'primary' }]));
+  elements.push(actions([{ text: '刷新状态', value: { cmd: 'ws.current' } }]));
+  return shell('📂 当前项目', elements);
+}
+
 export function workspacesCard(current: string | undefined, named: Record<string, string>): object {
   const entries = Object.entries(named);
   const elements: object[] = [];
