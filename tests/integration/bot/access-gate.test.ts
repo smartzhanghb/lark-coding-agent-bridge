@@ -69,6 +69,18 @@ describe('unified access gates', () => {
     expect(lastMarkdown(channel)).toContain('仅管理员可用');
   });
 
+  it('ignores blocked comment authors before fetching document content', async () => {
+    const root = await makeRoot();
+    const agent = new FakeAgentAdapter();
+    const activeRuns = new ActiveRuns();
+    await handleCommentMention({
+      channel: {} as Parameters<typeof handleCommentMention>[0]['channel'], evt: commentEvent('ou_bad'), agent,
+      sessions: new SessionStore(join(root, 'sessions.json')), workspaces: new WorkspaceStore(join(root, 'workspaces.json')), activeRuns,
+      executor: new RunExecutor({ agent, pool: new ProcessPool(() => 1), activeRuns }),
+      controls: makeControls({ owner: 'ou_owner', access: { blockedUsers: ['ou_bad'] } }),
+    });
+    expect(agent.runOptions).toHaveLength(0);
+  });
   it('does not apply IM access gates to cloud-doc comment mentions', async () => {
     const root = await makeRoot();
     const calls: string[] = [];

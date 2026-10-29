@@ -48,4 +48,18 @@ describe('directory scheduling under contention', () => {
     await executor.cancel('late-cancel'); unblock(); await rejected; expect(agent.runOptions).toHaveLength(0);
   });
 
+  it('cancels only jobs containing the blocked actor, including queued merged batches', async () => {
+    const pool = new ProcessPool(() => 1); const hold = await pool.acquire();
+    const agent = new FakeAgentAdapter(); const executor = new RunExecutor({ agent, pool, activeRuns: new ActiveRuns() });
+    const rejected = expect(executor.submit({ scopeId: 'merged', actorIds: ['ou_good', 'ou_bad'], policy: policy() })).rejects.toMatchObject({ code: 'cancelled' });
+    const good = executor.submit({ scopeId: 'good', actorIds: ['ou_good'], policy: policy() });
+    await executor.cancelActor('ou_bad'); await rejected; hold();
+    const running = await good;
+    expect(agent.runOptions).toHaveLength(1);
+    await executor.cancelActor('ou_other'); expect(agent.runs[0]?.stopped).toBe(false);
+    await executor.cancelActor('ou_good'); expect(agent.runs[0]?.stopped).toBe(true);
+    for await (const _ of running.subscribe()) { /* drain */ }
+    expect(executor.snapshot()).toEqual([]);
+  });
+
 });

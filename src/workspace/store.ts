@@ -1,6 +1,7 @@
 import { copyFile, readFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute } from 'node:path';
+import { validModelId } from '../agent/models';
 import { paths } from '../config/paths';
 import { log } from '../core/logger';
 import { writeFileAtomic } from '../platform/atomic-write';
@@ -11,6 +12,8 @@ export interface ProjectWorkspace {
   name: string;
   cwd: string;
   enabled: boolean;
+  /** undefined inherits the profile; default follows the CLI. */
+  model?: string;
 }
 export interface WorkspaceBinding { projectId?: string; revision: number; blocked?: boolean }
 export interface Conversation {
@@ -20,6 +23,7 @@ export interface Conversation {
   name?: string;
   lastActivity: number;
   ownerDm?: boolean;
+  actualModel?: string;
 }
 interface WorkspaceData {
   schemaVersion: 2;
@@ -51,7 +55,7 @@ export class WorkspaceStore {
       }
       for (const value of Object.values(raw.chats ?? {})) if (!value || typeof value.cwd !== 'string') throw new Error('历史目录数据无效');
       for (const value of Object.values(raw.named ?? {})) if (typeof value !== 'string') throw new Error('历史目录别名无效');
-      for (const [id, value] of Object.entries(raw.projects ?? {})) if (!value || value.id !== id || typeof value.name !== 'string' || typeof value.cwd !== 'string' || typeof value.enabled !== 'boolean') throw new Error('项目数据无效');
+      for (const [id, value] of Object.entries(raw.projects ?? {})) if (!value || value.id !== id || typeof value.name !== 'string' || typeof value.cwd !== 'string' || typeof value.enabled !== 'boolean' || (value.model !== undefined && (typeof value.model !== 'string' || !validModelId(value.model)))) throw new Error('项目数据无效');
       for (const value of Object.values(raw.epochs ?? {})) if (!Number.isSafeInteger(value) || value < 0) throw new Error('会话代次无效');
       for (const value of Object.values(raw.bindings ?? {})) if (!value || !Number.isSafeInteger(value.revision) || (value.projectId !== undefined && typeof value.projectId !== 'string')) throw new Error('绑定数据无效');
       for (const value of Object.values(raw.conversations ?? {})) if (!value || typeof value.id !== 'string' || typeof value.chatId !== 'string' || !['p2p', 'group', 'topic'].includes(value.type)) throw new Error('会话目录数据无效');
@@ -115,7 +119,14 @@ export class WorkspaceStore {
   async observe(conversation: Conversation): Promise<void> {
     await this.mutate((d) => { d.conversations[conversation.id] = { ...d.conversations[conversation.id], ...conversation }; });
   }
-  async saveProject(input: { id?: string; name: string; cwd: string; enabled?: boolean }): Promise<ProjectWorkspace> {
+  async recordModel(scope: string, model: string, generation?: string): Promise<void> {
+    await this.mutate((d) => {
+      if (generation !== undefined && generation !== this.generation(scope)) return;
+      if (d.conversations[scope]) d.conversations[scope].actualModel = model;
+    });
+  }
+  async saveProject(input: { id?: string; name: string; cwd: string; enabled?: boolean; model?: string | null }): Promise<ProjectWorkspace> {
+    if (input.model != null && !validModelId(input.model)) throw new Error('模型 ID 无效');
     if (!isAbsolute(input.cwd)) throw new Error('请使用绝对目录路径');
     const name = input.name.trim();
     if (!name || name.length > 100) throw new Error('项目名称需为 1–100 个字符');
@@ -131,9 +142,14 @@ export class WorkspaceStore {
       if (prev && prev.cwd !== targetCwd && Object.values(d.bindings).some((b) => b.projectId === prev.id)) throw new Error('项目已绑定聊天，请先解绑再更换目录');
       const id = input.id ?? randomUUID();
       result = { id, name, cwd: targetCwd, enabled: input.enabled ?? prev?.enabled ?? true };
+      const model = input.model === null ? undefined : input.model ?? prev?.model;
+      if (model !== undefined) result.model = model;
       d.projects[id] = result;
-      if (prev?.enabled !== result.enabled) for (const [scope, b] of Object.entries(d.bindings)) {
-        if (b.projectId === id) d.epochs[scope] = (d.epochs[scope] ?? 0) + 1;
+      if (prev?.enabled !== result.enabled || prev?.model !== result.model) for (const [scope, b] of Object.entries(d.bindings)) {
+        if (b.projectId === id) {
+          d.epochs[scope] = (d.epochs[scope] ?? 0) + 1;
+          for (const c of Object.values(d.conversations)) if (c.id === scope || c.id.startsWith(`${scope}:`)) delete c.actualModel;
+        }
       }
     });
     return { ...result };
@@ -150,6 +166,7 @@ export class WorkspaceStore {
       if (this.generation(scope) !== expectedRevision) throw new Error('绑定已变化，请刷新后重试');
       if (projectId && !d.projects[projectId]?.enabled) throw new Error('项目不存在或已停用');
       d.epochs[scope] = (d.epochs[scope] ?? 0) + 1;
+      for (const c of Object.values(d.conversations)) if (c.id === scope || c.id.startsWith(`${scope}:`)) delete c.actualModel;
       // An explicit unbind blocks topic inheritance and owner-default fallback.
       d.bindings[scope] = { projectId, blocked: !projectId, revision: d.epochs[scope]! };
     });
@@ -158,6 +175,7 @@ export class WorkspaceStore {
     if (!scope.includes(':')) throw new Error('只有话题可设置为继承群工作区');
     await this.mutate((d) => {
       if (this.generation(scope) !== expectedRevision) throw new Error('绑定已变化，请刷新后重试');
+      if (d.conversations[scope]) delete d.conversations[scope].actualModel;
       delete d.bindings[scope]; d.epochs[scope] = (d.epochs[scope] ?? 0) + 1;
     });
   }

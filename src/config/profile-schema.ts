@@ -19,6 +19,7 @@ export type { AccessMode, PermissionConfig, PermissionSource };
 
 export interface ProfileAccess {
   allowedUsers: string[];
+  blockedUsers?: string[];
   allowedChats: string[];
   admins: string[];
   requireMentionInGroup: boolean;
@@ -347,6 +348,7 @@ function normalizeAccess(
   const chatRequireMention = normalizeChatMentionMap(access?.chatRequireMention);
   return {
     allowedUsers: stringArray(access?.allowedUsers),
+    ...(Array.isArray(access?.blockedUsers) ? { blockedUsers: stringArray(access.blockedUsers) } : {}),
     allowedChats: stringArray(access?.allowedChats),
     admins: stringArray(access?.admins),
     requireMentionInGroup: access?.requireMentionInGroup ?? legacyRequireMentionInGroup ?? true,

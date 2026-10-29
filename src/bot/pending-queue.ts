@@ -56,6 +56,13 @@ export class PendingQueue {
     return entry.messages;
   }
 
+  removeSender(senderId: string): void {
+    for (const [scope, entry] of this.map) {
+      entry.messages = entry.messages.filter((m) => m.senderId !== senderId);
+      if (!entry.messages.length) this.cancel(scope);
+    }
+  }
+
   cancelAll(): void {
     for (const entry of this.map.values()) {
       if (entry.timer) clearTimeout(entry.timer);

@@ -239,8 +239,18 @@ async function route(
     return;
   }
   if (path === '/api/access' && p) {
-    const { state } = await resolveTargetState(deps, url);
-    sendJson(res, 200, await mutateAccess(state, await readJsonBody(req)));
+    const { state, controls } = await resolveTargetState(deps, url);
+    const body = await readJsonBody(req) as Record<string, unknown>;
+    if (body?.kind === 'blocked') {
+      if (!controls?.botOwnerId) throw new HttpError(409, '请先启动机器人并确认所有者');
+      if (body.action === 'add' && typeof body.id === 'string' && body.id.trim() === controls.botOwnerId) throw new HttpError(400, '不能封禁机器人所有者');
+    }
+    const result = await mutateAccess(state, body);
+    if (body?.kind === 'blocked' && body.action === 'add' && typeof body.id === 'string') {
+      controls?.workspaceRuntime?.pending.removeSender(body.id.trim());
+      await controls?.workspaceRuntime?.executor.cancelActor(body.id.trim());
+    }
+    sendJson(res, 200, result);
     return;
   }
   if (path === '/api/chats' && g) {

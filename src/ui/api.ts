@@ -66,6 +66,7 @@ export interface ConfigView {
   meeting: MeetingConfig;
   access: {
     allowedUsers: string[];
+    blockedUsers: string[];
     allowedChats: string[];
     admins: string[];
     /** Per-chat @-mention override (chat_id → bool); overrides the global
@@ -95,6 +96,7 @@ export function buildConfigView(state: MutableProfileState, live = false): Confi
     meeting: state.profileConfig.meeting,
     access: {
       allowedUsers: state.profileConfig.access.allowedUsers,
+      blockedUsers: state.profileConfig.access.blockedUsers ?? [],
       allowedChats: state.profileConfig.access.allowedChats,
       admins: state.profileConfig.access.admins,
       chatRequireMention: state.profileConfig.access.chatRequireMention ?? {},
@@ -339,9 +341,10 @@ export async function applyConfigToDisk(
   return buildConfigView(state, false);
 }
 
-type AccessKind = 'user' | 'admin' | 'chat';
-const ACCESS_LIST: Record<AccessKind, 'allowedUsers' | 'admins' | 'allowedChats'> = {
+type AccessKind = 'user' | 'admin' | 'chat' | 'blocked';
+const ACCESS_LIST: Record<AccessKind, 'allowedUsers' | 'admins' | 'allowedChats' | 'blockedUsers'> = {
   user: 'allowedUsers',
+  blocked: 'blockedUsers',
   admin: 'admins',
   chat: 'allowedChats',
 };
@@ -384,14 +387,15 @@ export async function mutateAccess(
   if (action !== 'add' && action !== 'remove') {
     throw new ApiError(400, 'action must be add|remove|set-mention');
   }
-  if (kind !== 'user' && kind !== 'admin' && kind !== 'chat') {
-    throw new ApiError(400, 'kind must be user|admin|chat');
+  if (kind !== 'user' && kind !== 'admin' && kind !== 'chat' && kind !== 'blocked') {
+    throw new ApiError(400, 'kind must be user|admin|chat|blocked');
   }
   if (!id) throw new ApiError(400, 'id is required');
+  if (kind === 'blocked' && !/^ou_[a-zA-Z0-9_]+$/.test(id)) throw new ApiError(400, '请输入用户 open_id（ou_...）');
   const listKey = ACCESS_LIST[kind];
 
   const access = await saveAccessConfig(state, (current) => {
-    const set = new Set(current[listKey]);
+    const set = new Set(current[listKey] ?? []);
     if (action === 'add') set.add(id);
     else set.delete(id);
     const next = { ...current, [listKey]: [...set] };
@@ -403,12 +407,14 @@ export async function mutateAccess(
     }
     return next;
   });
+  if (kind === 'blocked') log.info('ui', 'user-block-updated', { profile: state.profile, action, userId: id });
   return accessView(access);
 }
 
 function accessView(access: ProfileAccess): ConfigView['access'] {
   return {
     allowedUsers: access.allowedUsers,
+    blockedUsers: access.blockedUsers ?? [],
     allowedChats: access.allowedChats,
     admins: access.admins,
     chatRequireMention: access.chatRequireMention ?? {},

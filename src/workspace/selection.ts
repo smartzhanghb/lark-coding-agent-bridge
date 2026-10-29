@@ -7,5 +7,8 @@ export function selectedWorkspace(input: { workspaces: WorkspaceStore; profileCo
   if (!input.workspaces.binding(input.scope) && input.ownerDm) return input.profileConfig.workspaces.default;
   return undefined;
 }
+export function selectedModel(input: { workspaces: WorkspaceStore; profileConfig: ProfileConfig; scope: string }): string | undefined {
+  return (input.profileConfig.workspaces.managedBindings ? input.workspaces.selection(input.scope).project?.model : undefined) ?? input.profileConfig.preferences.model;
+}
 export function generationFingerprint(fingerprint: string, generation: string): string { return `${fingerprint}:generation=${generation}`; }
 export function baseFingerprint(fingerprint: string): string { return fingerprint.split(':generation=')[0]!; }

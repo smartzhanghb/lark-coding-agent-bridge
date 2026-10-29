@@ -18,6 +18,7 @@ export interface RunExecutorDeps {
 
 export interface SubmitRunInput {
   scopeId: string;
+  actorIds?: string[];
   policy: RunPolicyAllow;
   sessionId?: string;
   threadId?: string;
@@ -56,7 +57,7 @@ export class RunExecutor {
   private readonly postDoneExitGraceMs: number;
   private cancellationVersions = new Map<string, number>();
   version(scope: string): number { return this.cancellationVersions.get(scope) ?? 0; }
-  private jobs = new Map<string, { controller: AbortController; cwd: string; state: 'queued' | 'running'; stop?: () => Promise<void> }>();
+  private jobs = new Map<string, { controller: AbortController; cwd: string; actorIds?: string[]; state: 'queued' | 'running'; stop?: () => Promise<void> }>();
   snapshot() { return [...this.jobs].map(([scope, job]) => ({ scope, cwd: job.cwd, state: job.state })); }
   async cancel(scope: string): Promise<boolean> {
     this.cancellationVersions.set(scope, this.version(scope) + 1);
@@ -65,6 +66,9 @@ export class RunExecutor {
     job.controller.abort();
     if (job.stop) await job.stop();
     return true;
+  }
+  async cancelActor(actorId: string): Promise<void> {
+    await Promise.all([...this.jobs].filter(([, j]) => j.actorIds?.includes(actorId)).map(([scope]) => this.cancel(scope)));
   }
   async cancelAll(): Promise<void> { await Promise.all([...this.jobs.keys()].map((scope) => this.cancel(scope))); }
 
@@ -96,7 +100,7 @@ export class RunExecutor {
     }
 
     const controller = new AbortController();
-    const job: { controller: AbortController; cwd: string; state: 'queued' | 'running'; stop?: () => Promise<void> } = { controller, cwd: input.policy.cwdRealpath, state: 'queued' };
+    const job: { controller: AbortController; cwd: string; actorIds?: string[]; state: 'queued' | 'running'; stop?: () => Promise<void> } = { controller, cwd: input.policy.cwdRealpath, actorIds: input.actorIds, state: 'queued' };
     this.jobs.set(input.scopeId, job);
     input.onQueued?.([...this.jobs.values()].filter((j) => j.state === 'queued' && j.cwd === job.cwd).length);
     let releaseDirectory: (() => void) | undefined;

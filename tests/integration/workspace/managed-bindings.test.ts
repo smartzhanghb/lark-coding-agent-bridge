@@ -11,6 +11,7 @@ import { SessionStore } from '../../../src/session/store';
 import { SessionCatalog } from '../../../src/session/catalog';
 import { RunExecutor } from '../../../src/runtime/run-executor';
 import { ActiveRuns } from '../../../src/bot/active-runs';
+import type { NormalizedMessage as QueueMessage } from '@larksuite/channel';
 import { PendingQueue } from '../../../src/bot/pending-queue';
 import { ProcessPool } from '../../../src/bot/process-pool';
 import { FakeAgentAdapter } from '../../helpers/fake-agent';
@@ -51,6 +52,56 @@ async function harness() {
 async function drain(execution: { subscribe(): AsyncIterable<unknown> }) { for await (const _ of execution.subscribe()) { /* drain */ } }
 
 describe('managed workspace bindings', () => {
+  it('round-trips per-project model ids, forwards exact args, and resets inherited sessions', async () => {
+    const h = await harness();
+    const modelDir = join(h.tmp.profile, 'claude-models'); await mkdir(modelDir);
+    await writeFile(join(modelDir, 'settings.json'), JSON.stringify({ modelPicker: { options: [{ model: 'glm[1M]', label: 'GLM' }, { model: 'kimi', label: 'Kimi' }] } }));
+    vi.stubEnv('CLAUDE_CONFIG_DIR', modelDir);
+    try {
+      await h.workspaces.saveProject({ ...h.project, model: 'glm[1M]' });
+      await h.workspaces.bind('oc_group', h.project.id, '0:0');
+      const r = await h.run('oc_group:topic'); expect(r.ok).toBe(true); if (r.ok) await drain(r.execution);
+      expect(h.agent.runOptions[0]?.model).toBe('glm[1M]');
+      const generation = h.workspaces.generation('oc_group:topic');
+      await h.workspaces.saveProject({ ...h.project, model: 'kimi' });
+      expect(h.workspaces.generation('oc_group:topic')).not.toBe(generation);
+      const r2 = await h.run('oc_group:topic'); expect(r2.ok).toBe(true); if (r2.ok) await drain(r2.execution);
+      expect(h.agent.runOptions[1]?.model).toBe('kimi');
+      expect(h.agent.runOptions[1]?.sessionId).toBeUndefined();
+      const reopened = new WorkspaceStore(join(h.tmp.profile, 'workspaces.json')); await reopened.load();
+      expect(reopened.project(h.project.id)?.model).toBe('kimi');
+      await writeFile(join(modelDir, 'settings.json'), '{}');
+      expect(await h.run()).toMatchObject({ ok: false, rejectReason: { code: 'model-unavailable' } });
+      expect(h.agent.runOptions).toHaveLength(2);
+      await h.workspaces.saveProject({ ...h.project, model: null });
+      expect(h.workspaces.project(h.project.id)?.model).toBeUndefined();
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('cancels a merged request if any actor becomes blocked before spawn', async () => {
+    const h = await harness(); await h.workspaces.bind('oc_group', h.project.id, '0:0');
+    h.profileConfig.access.blockedUsers = ['ou_bad'];
+    const r = await h.run('oc_group', { actorIds: ['ou_user', 'ou_bad'] });
+    expect(r.ok).toBe(false); expect(h.agent.runOptions).toHaveLength(0);
+  });
+  it('records CLI model reports only for the current binding generation', async () => {
+    const h = await harness(); await h.workspaces.observe({ id: 'oc_group', chatId: 'oc_group', type: 'group', lastActivity: 1 });
+    await h.workspaces.bind('oc_group', h.project.id, '0:0');
+    const old = h.workspaces.generation('oc_group');
+    await h.workspaces.recordModel('oc_group', 'glm-actual', old);
+    expect((await workspaceView(h.ctx().controls)).conversations[0]?.actualModel).toBe('glm-actual');
+    await h.workspaces.saveProject({ ...h.project, model: 'default' });
+    await h.workspaces.recordModel('oc_group', 'stale-model', old);
+    expect(h.workspaces.conversations()[0]?.actualModel).toBeUndefined();
+  });
+  it('removes only the blocked sender from a pending merged batch', () => {
+    const queue = new PendingQueue(10000, () => {});
+    queue.push('group', { senderId: 'ou_bad' } as QueueMessage);
+    queue.push('group', { senderId: 'ou_good' } as QueueMessage);
+    queue.push('private', { senderId: 'ou_bad' } as QueueMessage);
+    queue.removeSender('ou_bad');
+    expect(queue.scopes()).toEqual(['group']);
+    expect(queue.cancel('group').map((m) => m.senderId)).toEqual(['ou_good']);
+  });
   it('blocks unbound coworker chats and limits default fallback to the owner DM', async () => {
     const h = await harness();
     expect(await h.run()).toMatchObject({ ok: false, rejectReason: { code: 'workspace-unbound' } });

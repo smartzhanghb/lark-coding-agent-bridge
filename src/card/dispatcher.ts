@@ -49,6 +49,7 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
   const payload = value as Record<string, unknown>;
 
   const operatorId = deps.evt.operator.openId;
+  if (deps.controls.profileConfig.access.blockedUsers?.includes(operatorId)) return;
   const chatId = deps.evt.chatId;
 
   // CardKit 2.0 form submits drop user-input values from action.value; they

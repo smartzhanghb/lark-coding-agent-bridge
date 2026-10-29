@@ -5,6 +5,7 @@ import { defineConfig } from "vitest/config";
 // vitest too. Without this, vite's import-analysis tries to parse the built
 // console HTML as JS and fails.
 export default defineConfig({
+  test: { setupFiles: ['./tests/helpers/model-environment.ts'] },
   plugins: [
     {
       name: "html-string-loader",

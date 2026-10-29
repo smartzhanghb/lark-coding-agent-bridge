@@ -88,6 +88,7 @@ export interface ExtractCommentQuestionResult {
  */
 export async function handleCommentMention(deps: CommentDeps): Promise<void> {
   const { channel, evt, sessions, sessionCatalog, workspaces, controls } = deps;
+  if (controls.profileConfig.access.blockedUsers?.includes(evt.operator.openId)) return;
   const eventDocScopeId = commentDocumentScopeId(evt.fileToken);
   const eventCommentScopeId = commentScopeId(evt.fileToken, evt.commentId);
   // Log every comment event we receive, regardless of whether we'll act on it.
@@ -257,6 +258,8 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
       });
 
       const execution = await deps.executor.submit({
+        actorIds: [evt.operator.openId],
+        beforeSpawn: async () => { if (controls.profileConfig.access.blockedUsers?.includes(evt.operator.openId)) throw new Error('当前请求无法处理，请联系管理员。'); },
         scopeId: runScopeId,
         policy,
         sessionId,

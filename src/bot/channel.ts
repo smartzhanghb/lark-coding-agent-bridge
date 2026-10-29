@@ -1,3 +1,4 @@
+import { selectedModel } from '../workspace/selection';
 import { stampWorkspaceMessage, workspaceMessageGeneration } from '../workspace/message-context';
 import { affectedScope } from '../workspace/service';
 import { selectedWorkspace } from '../workspace/selection';
@@ -717,6 +718,9 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
       sender: msg.senderId.slice(-6),
       reason: accessDecision.reason,
     });
+    if (accessDecision.reason === 'blocked-user' && (msg.chatType === 'p2p' || msg.mentionedBot)) {
+      await channel.send(msg.chatId, { markdown: '当前请求无法处理，请联系管理员。' }, { replyTo: msg.messageId });
+    }
     if (msg.chatType !== 'p2p' && accessDecision.reason === 'denied-chat' && msg.mentionedBot) {
       void sendNonAllowedGroupHint(channel, msg.chatId, msg.messageId).catch((err) =>
         log.warn('intake', 'non-allowed-hint-failed', { err: String(err) }),
@@ -922,15 +926,16 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // changed. `requestedModel` (the `--model` value, or undefined for default)
   // is reused below to log requested-vs-actual against the init event.
   const agentKind = controls.profileConfig.agentKind;
-  const modelPref = controls.profileConfig.preferences.model;
-  const modelSelection = normalizeModelSelection(agentKind, modelPref);
-  const requestedModel = resolveModelArg(agentKind, modelPref);
+  const modelPref = selectedModel({ workspaces, profileConfig: controls.profileConfig, scope });
+  const modelCwd = selectedWorkspace({ workspaces, profileConfig: controls.profileConfig, scope, ownerDm: mode === 'p2p' && firstMsg.senderId === controls.botOwnerId });
+  const modelSelection = normalizeModelSelection(agentKind, modelPref, modelCwd);
+  const requestedModel = resolveModelArg(agentKind, modelPref, modelCwd);
   const prevModel = lastRunModelByScope.get(scope);
   const modelSwitched = prevModel !== undefined && prevModel !== modelSelection;
   lastRunModelByScope.set(scope, modelSelection);
   const extraInstructions = modelSwitched
     ? [
-        `用户刚把本会话使用的模型切换为「${modelLabel(agentKind, modelPref)}」。` +
+        `用户刚把本会话使用的模型切换为「${modelLabel(agentKind, modelPref, modelCwd)}」。` +
           '之前的对话里可能提到别的模型,请以当前模型为准;若被问到你用的是什么模型,据此回答。',
       ]
     : undefined;
@@ -987,6 +992,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     prompt,
     attachments: attachments.map(toPolicyAttachment),
     access: accessDecision,
+    actorIds: [...new Set(batch.map((m) => m.senderId))],
     capability,
     profileConfig: controls.profileConfig,
     sessions,
