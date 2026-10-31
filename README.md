@@ -1,3 +1,5 @@
+> This fork adds owner-managed chat workspace bindings and cancellable directory scheduling. See [workspace operations and compatibility](docs/WORKSPACES.md).
+
 # lark-channel-bridge
 
 A lightweight bot that bridges Feishu / Lark messenger with your local Claude Code or Codex CLI. Run one command, scan a QR code to bind a PersonalAgent app, and talk to your local coding agent from chat.
@@ -7,6 +9,8 @@ A lightweight bot that bridges Feishu / Lark messenger with your local Claude Co
 For a product walkthrough, see the [Feishu document](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e).
 
 ## What it does
+
+- Group replies automatically mention the human authors of the current request batch, without mentioning quoted authors or other bots. Direct messages stay unchanged. Text, card and streaming replies are covered; tools sending results directly can use the per-run `LARK_REPLY_CONTEXT` notification metadata (never an authorization credential).
 
 - Forwards Feishu / Lark messages to local Claude Code or Codex CLI. Send a DM directly, or `@bot` in a group.
 - **Streaming card**: text replies and tool calls update on one Lark card in real time.

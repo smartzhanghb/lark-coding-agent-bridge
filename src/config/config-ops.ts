@@ -85,6 +85,7 @@ export async function saveAccessConfig(
           ...(state.cfg.preferences ?? {}),
           access: {
             allowedUsers: access.allowedUsers,
+            ...(access.blockedUsers ? { blockedUsers: access.blockedUsers } : {}),
             allowedChats: access.allowedChats,
             admins: access.admins,
             ...(access.chatRequireMention && Object.keys(access.chatRequireMention).length > 0

@@ -1,3 +1,5 @@
+import { baseFingerprint, generationFingerprint } from '../workspace/selection';
+import { changeBinding, type WorkspaceRuntime } from '../workspace/service';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -24,7 +26,7 @@ import {
 import { GROUP_MSG_SCOPE, hasGroupMsgScope } from '../bot/app-scope';
 import { requestScopeGrantLink } from '../bot/wizard';
 import { forgetManagedCard, sendManagedCard, updateManagedCard } from '../card/managed';
-import { helpCard, resumeCard, statusCard, workspacesCard } from '../card/templates';
+import { helpCard, resumeCard, statusCard, workspacesCard, managedWorkspaceCard } from '../card/templates';
 import type { AppConfig, AppPreferences, MessageReplyMode, TenantBrand } from '../config/schema';
 import {
   getAgentStopGraceMs,
@@ -87,6 +89,7 @@ import type { MeetingSession } from '../meeting/session';
 import { hasStructuredLarkCliUserAuth } from '../lark-cli/identity-policy';
 
 export interface Controls {
+  workspaceRuntime?: WorkspaceRuntime;
   profile: string;
   profileConfig: ProfileConfig;
   botOwnerId?: string;
@@ -201,7 +204,6 @@ const ADMIN_COMMANDS = new Set([
   '/reconnect',
   '/doctor',
   '/cd',
-  '/ws',
   '/invite',
   '/remove',
   // Joining a meeting makes the bot visible to every participant and exposes
@@ -209,6 +211,10 @@ const ADMIN_COMMANDS = new Set([
   '/meeting',
 ]);
 
+function workspaceOwnerCommand(cmd: string, args: string): boolean {
+  return cmd === '/cd' || (cmd === '/ws' && !['', 'current', 'list'].includes(args.trim().split(/\s+/)[0] ?? '')) ||
+    ((cmd === '/new' || cmd === '/reset') && /^chat(?:\s|$)/.test(args.trim()));
+}
 function isAdminCommand(cmd: string): boolean {
   return ADMIN_COMMANDS.has(cmd.startsWith('/') ? cmd : `/${cmd}`);
 }
@@ -221,8 +227,11 @@ export async function tryHandleCommand(ctx: CommandContext): Promise<boolean> {
   const args = parts.slice(1).join(' ');
   const h = handlers[cmd];
   if (!h) return false;
+  if (workspaceOwnerCommand(cmd, args) && ctx.controls.profileConfig.workspaces.managedBindings && ctx.msg.senderId !== ctx.controls.botOwnerId) {
+    await reply(ctx, '工作区绑定仅机器人所有者可修改。'); return true;
+  }
   if (
-    isAdminCommand(cmd) &&
+    (isAdminCommand(cmd) || (cmd === '/ws' && !ctx.controls.profileConfig.workspaces.managedBindings)) &&
     !canRunAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId).ok
   ) {
     log.info('command', 'admin-deny', {
@@ -237,6 +246,7 @@ export async function tryHandleCommand(ctx: CommandContext): Promise<boolean> {
   } catch (err) {
     log.fail('command', err, { cmd });
     reportMetric('command_fail', 1, { step: 'dispatch' });
+    await reply(ctx, `操作未完成：${err instanceof Error ? err.message : String(err)}`);
   }
   return true;
 }
@@ -249,8 +259,11 @@ export async function runCommandHandler(
 ): Promise<boolean> {
   const h = handlers[`/${name}`];
   if (!h) return false;
+  if (workspaceOwnerCommand(`/${name}`, args) && ctx.controls.profileConfig.workspaces.managedBindings && ctx.msg.senderId !== ctx.controls.botOwnerId) {
+    await reply(ctx, '工作区绑定仅机器人所有者可修改。'); return true;
+  }
   if (
-    isAdminCommand(name) &&
+    (isAdminCommand(name) || (name === 'ws' && !ctx.controls.profileConfig.workspaces.managedBindings)) &&
     !canRunAdminCommand(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId).ok
   ) {
     log.info('command', 'admin-deny', {
@@ -268,6 +281,7 @@ export async function runCommandHandler(
   } catch (err) {
     log.fail('command', err, { cmd: name });
     reportMetric('command_fail', 1, { step: 'handler' });
+    await reply(ctx, `操作未完成：${err instanceof Error ? err.message : String(err)}`);
   }
   return true;
 }
@@ -331,6 +345,12 @@ async function handleNew(args: string, ctx: CommandContext): Promise<void> {
     return handleNewChat(rawName, ctx);
   }
 
+  if (ctx.controls.profileConfig.workspaces.managedBindings) {
+    const rt = ctx.controls.workspaceRuntime;
+    rt?.pending.cancel(ctx.scope);
+    await ctx.runExecutor?.cancel(ctx.scope);
+    await ctx.workspaces.reset(ctx.scope);
+  }
   const wasRunning = ctx.activeRuns.interrupt(ctx.scope);
   if (ctx.sessionCatalog && ctx.sessionCatalogIdentity) {
     ctx.sessionCatalog.archiveActive({
@@ -362,11 +382,16 @@ async function handleNewChat(rawName: string, ctx: CommandContext): Promise<void
   // Inherit cwd from the originating chat so the new group starts in the
   // same workspace; otherwise it'll fall back to $HOME.
   if (sourceCwd) {
-    ctx.workspaces.setCwd(created.chatId, sourceCwd);
+    if (ctx.controls.profileConfig.workspaces.managedBindings) {
+      const project = ctx.workspaces.selection(ctx.scope).project;
+      if (project) await ctx.workspaces.bind(created.chatId, project.id, ctx.workspaces.generation(created.chatId));
+    } else ctx.workspaces.setCwd(created.chatId, sourceCwd);
   }
 
   // Welcome the user inside the new group with a hint about how to start.
-  const welcome = sourceCwd
+  const welcome = ctx.controls.profileConfig.workspaces.managedBindings
+    ? '🎉 群已建好。工作区由机器人所有者管理，使用 `/ws current` 查看。'
+    : sourceCwd
     ? `🎉 群已建好，cwd 继承自原群：\`${sourceCwd}\`\n\n@我 + 任意消息开始对话。`
     : '🎉 群已建好。\n\n@我 + 任意消息开始对话。';
   try {
@@ -382,6 +407,13 @@ async function handleNewChat(rawName: string, ctx: CommandContext): Promise<void
 }
 
 async function handleCd(args: string, ctx: CommandContext): Promise<void> {
+  if (ctx.controls.profileConfig.workspaces.managedBindings) {
+    if (!isAbsoluteOrTilde(args.trim())) throw new Error('请使用绝对路径，或 ~/xxx');
+    const path = expandTilde(args.trim());
+    const existing = ctx.workspaces.projects().find((p) => p.cwd === path);
+    const project = existing ?? await ctx.workspaces.saveProject({ name: path.split('/').filter(Boolean).pop() || '项目', cwd: path });
+    await bindManaged(ctx, project.id); return;
+  }
   const input = args.trim();
   if (!input) {
     await reply(ctx, '用法：`/cd <绝对路径>` 或 `/cd ~/xxx`');
@@ -404,6 +436,7 @@ async function handleCd(args: string, ctx: CommandContext): Promise<void> {
 }
 
 async function handleWs(args: string, ctx: CommandContext): Promise<void> {
+  if (ctx.controls.profileConfig.workspaces.managedBindings) { await handleManagedWs(args, ctx); return; }
   const parts = args.trim().split(/\s+/);
   const sub = parts[0] ?? '';
   const name = parts.slice(1).join(' ').trim();
@@ -421,6 +454,50 @@ async function handleWs(args: string, ctx: CommandContext): Promise<void> {
     default:
       await reply(ctx, '用法：`/ws [list|save <name>|use <name>|remove <name>]`');
   }
+}
+
+async function bindManaged(ctx: CommandContext, projectId?: string, stop = false, inherit = false): Promise<void> {
+  const rt = ctx.controls.workspaceRuntime;
+  if (!rt) throw new Error('工作区管理当前不可用，请重新连接机器人');
+  await changeBinding(rt, { scope: ctx.scope, projectId, revision: ctx.workspaces.generation(ctx.scope), stop, inherit });
+  await reply(ctx, projectId ? `已绑定项目「${ctx.workspaces.project(projectId)?.name}」，已开启新会话。` : inherit ? '已恢复继承群工作区，已开启新会话。' : '已解除工作区绑定，此聊天暂停执行任务。');
+}
+async function handleManagedWs(args: string, ctx: CommandContext): Promise<void> {
+  const [sub = 'current', ...rest] = args.trim().split(/\s+/);
+  const stop = rest.at(-1) === '--stop';
+  const name = (stop ? rest.slice(0, -1) : rest).join(' ');
+  const owner = ctx.msg.senderId === ctx.controls.botOwnerId;
+  if (!sub || sub === 'current' || sub === 'list') {
+    const current = ctx.workspaces.selection(ctx.scope);
+    const ownerDefault = owner && ctx.chatMode === 'p2p' && !ctx.workspaces.binding(ctx.scope) && ctx.controls.profileConfig.workspaces.default;
+    const lines = [ownerDefault ? '当前项目：**个人默认工作区**' : current.project ? `当前项目：**${current.project.name}**${current.project.enabled ? '' : '（已停用）'}` : '当前聊天未绑定项目，请等待机器人所有者绑定。'];
+    if (owner && ctx.chatMode === 'p2p') {
+      if (current.project) lines.push(`目录：\`${current.project.cwd}\` · ${current.source === 'inherited' ? '继承群绑定' : '独立绑定'}`);
+      if (sub === 'list') lines.push(...ctx.workspaces.projects().map((p) => `- ${p.name}${p.enabled ? '' : '（停用）'} → \`${p.cwd}\``));
+      lines.push('绑定：`/ws bind 项目名` · 停止任务并切换：`/ws bind 项目名 --stop` · 解绑：`/ws unbind`');
+    }
+    const state = ctx.runExecutor?.snapshot().find((j) => j.scope === ctx.scope)?.state;
+    if (state) lines.push(state === 'queued' ? '任务状态：排队中' : '任务状态：运行中');
+    const card = managedWorkspaceCard(lines.join('\n'), owner && ctx.chatMode === 'p2p' && sub === 'list' ? ctx.workspaces.projects().filter((p) => p.enabled) : [], ctx.workspaces.generation(ctx.scope));
+    await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx)); return;
+  }
+  if (!owner) { await reply(ctx, '工作区绑定仅机器人所有者可修改。'); return; }
+  if (sub === 'bind' || sub === 'use') {
+    const project = ctx.workspaces.project(name);
+    if (!project) throw new Error('项目不存在，请先在管理页面添加项目');
+    await bindManaged(ctx, project.id, stop); return;
+  }
+  if (sub === 'unbind' || sub === 'inherit') { await bindManaged(ctx, undefined, stop, sub === 'inherit'); return; }
+  if (sub === 'save') {
+    const cwd = effectiveWorkspaceCwd(ctx);
+    if (!cwd) throw new Error('当前聊天没有工作目录');
+    await ctx.workspaces.saveProject({ name, cwd }); await reply(ctx, `已保存项目「${name}」。`); return;
+  }
+  if (sub === 'remove' || sub === 'rm') {
+    const project = ctx.workspaces.project(name); if (!project) throw new Error('项目不存在');
+    await ctx.workspaces.deleteProject(project.id); await reply(ctx, '已删除项目。'); return;
+  }
+  await reply(ctx, '用法：`/ws current|list|bind 项目名|unbind|inherit|save 名称|remove 名称`');
 }
 
 async function handleWsList(ctx: CommandContext): Promise<void> {
@@ -534,6 +611,7 @@ function listScopedWorkspaces(ctx: CommandContext): Record<string, string> {
 }
 
 async function handleResume(args: string, ctx: CommandContext): Promise<void> {
+  if (ctx.controls.profileConfig.workspaces.managedBindings) { await handleManagedResume(args, ctx); return; }
   const parts = args.trim().split(/\s+/).filter(Boolean);
   const sub = parts[0] ?? '';
   const rest = parts.slice(1).join(' ').trim();
@@ -607,6 +685,33 @@ async function handleResume(args: string, ctx: CommandContext): Promise<void> {
   }));
   const card = resumeCard(cwd, entries);
   await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
+}
+
+async function handleManagedResume(args: string, ctx: CommandContext): Promise<void> {
+  if (ctx.msg.senderId !== ctx.controls.botOwnerId) { await reply(ctx, '历史会话恢复由机器人所有者操作。'); return; }
+  const identity = ctx.sessionCatalogIdentity;
+  if (!identity || !ctx.sessionCatalog) { await reply(ctx, '当前聊天没有可恢复的项目会话。'); return; }
+  if (args.trim().startsWith('use ')) {
+    const candidate = consumeResumeCandidate(args.trim().slice(4), identity);
+    if (!candidate) throw new Error('恢复选项已失效，请重新使用 /resume');
+    ctx.controls.workspaceRuntime?.pending.cancel(ctx.scope);
+    await ctx.runExecutor?.cancel(ctx.scope);
+    await ctx.workspaces.reset(ctx.scope);
+    const fingerprint = generationFingerprint(baseFingerprint(identity.policyFingerprint), ctx.workspaces.generation(ctx.scope));
+    ctx.sessions.clear(ctx.scope);
+    ctx.sessionCatalog.upsertActive({ ...identity, policyFingerprint: fingerprint, sessionId: candidate.sessionId, threadId: candidate.threadId });
+    if (candidate.sessionId) ctx.sessions.set(ctx.scope, candidate.sessionId, identity.cwdRealpath);
+    await Promise.all([ctx.sessions.flush(), ctx.sessionCatalog.flush()]);
+    await reply(ctx, '已恢复本聊天在当前项目的历史会话。'); return;
+  }
+  const candidates = ctx.sessionCatalog.entries().filter((e) => e.scopeId === ctx.scope && e.agentId === identity.agentId && e.cwdRealpath === identity.cwdRealpath && baseFingerprint(e.policyFingerprint) === baseFingerprint(identity.policyFingerprint))
+    .sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 10);
+  const seen = new Set<string>();
+  const lines = candidates.filter((c) => { const id = c.sessionId ?? c.threadId ?? ''; if (!id || seen.has(id)) return false; seen.add(id); return true; }).map((c) => {
+    const token = issueResumeCandidate(identity, c.agentId === 'claude' ? { sessionId: c.sessionId! } : { threadId: c.threadId! });
+    return `- ${new Date(c.updatedAt).toLocaleString('zh-CN')}：\`/resume use ${token}\``;
+  });
+  await reply(ctx, lines.length ? `仅列出本聊天在当前项目的历史（10 分钟有效）：\n${lines.join('\n')}` : '本聊天在当前项目没有可恢复的历史。');
 }
 
 async function applyResume(sessionId: string, ctx: CommandContext): Promise<void> {
@@ -752,6 +857,10 @@ async function listCodexResumeHistory(
 }
 
 function effectiveWorkspaceCwd(ctx: CommandContext): string | undefined {
+  if (ctx.controls.profileConfig.workspaces.managedBindings) {
+    const selection = ctx.workspaces.selection(ctx.scope);
+    return selection.project?.enabled ? selection.project.cwd : !ctx.workspaces.binding(ctx.scope) && ctx.chatMode === 'p2p' && ctx.msg.senderId === ctx.controls.botOwnerId ? ctx.controls.profileConfig.workspaces.default : undefined;
+  }
   return ctx.workspaces.cwdFor(ctx.scope) ?? ctx.controls.profileConfig.workspaces.default;
 }
 
@@ -810,6 +919,7 @@ async function larkCliStatus(ctx: CommandContext): Promise<'app' | 'user-ready' 
 }
 
 async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
+  if (ctx.controls.profileConfig.workspaces.managedBindings) { await handleManagedWs('current', ctx); return; }
   const cwd = effectiveWorkspaceCwd(ctx);
   const sess = ctx.sessions.getRaw(ctx.scope);
   const isCodex = ctx.controls.profileConfig.agentKind === 'codex';
@@ -853,12 +963,15 @@ async function handleStop(args: string, ctx: CommandContext): Promise<void> {
     return;
   }
   const scope = targetScope || ctx.scope;
-  const ok = ctx.activeRuns.interrupt(scope);
+  const pendingCancelled = ctx.controls.workspaceRuntime?.pending.cancel(scope).length ?? 0;
+  const cancelled = await ctx.runExecutor?.cancel(scope);
+  const ok = ctx.activeRuns.interrupt(scope) || cancelled === true;
   log.info('command', 'stop', {
     scope,
     targeted: Boolean(targetScope),
     interrupted: ok,
   });
+  if (ctx.controls.profileConfig.workspaces.managedBindings && !targetScope) await reply(ctx, ok || pendingCancelled ? '已停止当前聊天任务并取消排队消息。' : '当前聊天没有运行或排队任务。');
   if (targetScope) {
     await reply(
       ctx,

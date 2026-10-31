@@ -1,3 +1,4 @@
+import { stampWorkspaceMessage } from '../workspace/message-context';
 import type { CardActionEvent, LarkChannel, NormalizedMessage } from '@larksuite/channel';
 import type { AgentAdapter } from '../agent/types';
 import type { ActiveRuns } from '../bot/active-runs';
@@ -48,6 +49,7 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
   const payload = value as Record<string, unknown>;
 
   const operatorId = deps.evt.operator.openId;
+  if (deps.controls.profileConfig.access.blockedUsers?.includes(operatorId)) return;
   const chatId = deps.evt.chatId;
 
   // CardKit 2.0 form submits drop user-input values from action.value; they
@@ -65,6 +67,7 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
   // and can skip the chat allowlist for DMs.
   const { scope, threadId, mode } = await resolveScope(deps);
 
+  if ([...(deps.controls.workspaceRuntime?.changing ?? [])].some((s) => s === '*' || s === scope || scope.startsWith(`${s}:`))) return;
   const accessDecision =
     mode === 'p2p'
       ? canUseDm(deps.controls.profileConfig, deps.controls, operatorId)
@@ -84,6 +87,9 @@ export async function handleCardAction(deps: CardDispatchDeps): Promise<void> {
 
   const cmd = typeof payload.cmd === 'string' ? payload.cmd : '';
   if (cmd) {
+    if (deps.controls.profileConfig.workspaces.managedBindings && /^ws\.(use|bind|remove|rm|save|unbind|inherit)(?:\.|$)/.test(cmd) && payload.revision !== deps.workspaces.generation(scope)) {
+      await deps.channel.send(chatId, { markdown: '此工作区卡片已失效，请重新使用 /ws list。' }); return;
+    }
     if (isSignedBridgeCallback(payload) && !verifyBridgeToken(deps, payload, scope, cmd)) {
       return;
     }
@@ -194,6 +200,7 @@ function forwardToAgent(
     mentionedBot: false,
     createTime: Date.now(),
   };
+  stampWorkspaceMessage(synthetic, `${deps.workspaces.generation(scope)}|${deps.runExecutor?.version(scope) ?? 0}`);
   deps.pending.push(scope, synthetic);
 }
 

@@ -158,6 +158,19 @@ describe('ui server (supervisor-backed)', () => {
     expect(disk.profiles.claude.mode).toBe('personal');
   });
 
+  it('persists local-console bans, rejects owner bans and supports unban', async () => {
+    online.get('claude').botOwnerId = 'ou_owner';
+    expect((await post('/api/access', 'wrong-token', { action: 'add', kind: 'blocked', id: 'ou_bad' })).status).toBe(401);
+    expect((await post('/api/access', handle.token, { action: 'add', kind: 'blocked', id: 'ou_owner' })).status).toBe(400);
+    expect((await post('/api/access', handle.token, { action: 'add', kind: 'blocked', id: ' ou_owner ' })).status).toBe(400);
+    const added = await json(await post('/api/access', handle.token, { action: 'add', kind: 'blocked', id: 'ou_bad' }));
+    expect(added.blockedUsers).toEqual(['ou_bad']);
+    expect(online.get('claude').profileConfig.access.blockedUsers).toEqual(['ou_bad']);
+    expect((await loadRootConfig(configPath))?.profiles.claude?.access.blockedUsers).toEqual(['ou_bad']);
+    const removed = await json(await post('/api/access', handle.token, { action: 'remove', kind: 'blocked', id: 'ou_bad' }));
+    expect(removed.blockedUsers).toEqual([]);
+    expect((await loadRootConfig(configPath))?.profiles.claude?.access.blockedUsers).toEqual([]);
+  });
   it('adds and removes access entries', async () => {
     const added = await json(await post('/api/access', handle.token, { action: 'add', kind: 'user', id: 'ou_alice' }));
     expect(added.allowedUsers).toContain('ou_alice');

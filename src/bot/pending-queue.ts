@@ -46,12 +46,21 @@ export class PendingQueue {
     return 1;
   }
 
+  scopes(): string[] { return [...new Set([...this.map.keys(), ...this.blocked])]; }
+
   cancel(scope: string): NormalizedMessage[] {
     const entry = this.map.get(scope);
     if (!entry) return [];
     if (entry.timer) clearTimeout(entry.timer);
     this.map.delete(scope);
     return entry.messages;
+  }
+
+  removeSender(senderId: string): void {
+    for (const [scope, entry] of this.map) {
+      entry.messages = entry.messages.filter((m) => m.senderId !== senderId);
+      if (!entry.messages.length) this.cancel(scope);
+    }
   }
 
   cancelAll(): void {

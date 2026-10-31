@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, vi, describe, expect, it } from 'vitest';
 import {
   DEFAULT_MODEL,
   isDefaultModel,
@@ -44,5 +47,42 @@ describe('agent model catalog', () => {
   it('labels a stored value using the picker option text', () => {
     expect(modelLabel('claude', 'claude-opus-4-8')).toBe('Opus 4.8（最新）');
     expect(modelLabel('claude', DEFAULT_MODEL)).toContain('跟随默认');
+  });
+});
+
+const modelRoots: string[] = [];
+afterEach(() => { vi.unstubAllEnvs(); for (const dir of modelRoots.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+function modelSettings(settings: unknown) {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-models-')); modelRoots.push(dir);
+  vi.stubEnv('CLAUDE_CONFIG_DIR', dir);
+  writeFileSync(join(dir, 'settings.json'), JSON.stringify(settings));
+  return dir;
+}
+describe('Claude Code configured models', () => {
+  it('uses exact custom ids and labels instead of Anthropic names, and refreshes edits', () => {
+    const dir = modelSettings({ modelPicker: { replaceBuiltInOptions: true, options: [
+      { model: 'ccs-glm[1M]', label: 'GLM' }, { model: 'ccs-kimi', label: 'Kimi' },
+      { model: 'ccs-kimi', label: 'Kimi' }, { model: '--bad', label: 'bad' },
+    ] } });
+    expect(supportedModels('claude')).toEqual([{ value: 'default', label: '跟随默认（不指定）' }, { value: 'ccs-glm[1M]', label: 'GLM' }, { value: 'ccs-kimi', label: 'Kimi' }]);
+    expect(resolveModelArg('claude', 'ccs-glm[1M]')).toBe('ccs-glm[1M]');
+    expect(modelLabel('claude', 'ccs-kimi')).toBe('Kimi');
+    expect(supportedModels('codex').some((m) => m.value === 'ccs-kimi')).toBe(false);
+    writeFileSync(join(dir, 'settings.json'), JSON.stringify({ env: { ANTHROPIC_DEFAULT_OPUS_MODEL: 'new-glm', ANTHROPIC_DEFAULT_OPUS_MODEL_NAME: '新 GLM' } }));
+    expect(supportedModels('claude').slice(1)).toEqual([{ value: 'new-glm', label: '新 GLM' }]);
+  });
+  it('never invents Anthropic choices for an unconfigured proxy or malformed file', () => {
+    const dir = modelSettings({ env: { ANTHROPIC_BASE_URL: 'http://localhost:1234' } });
+    expect(supportedModels('claude').map((m) => m.value)).toEqual(['default']);
+    writeFileSync(join(dir, 'settings.json'), '{invalid');
+    expect(supportedModels('claude').map((m) => m.value)).toEqual(['default']);
+  });
+  it('reads project-local model menus without changing another workspace catalog', () => {
+    modelSettings({ modelPicker: { options: [{ model: 'global-kimi', label: 'Kimi' }] } });
+    const project = mkdtempSync(join(tmpdir(), 'bridge-model-project-')); modelRoots.push(project);
+    mkdirSync(join(project, '.claude'));
+    writeFileSync(join(project, '.claude', 'settings.local.json'), JSON.stringify({ modelPicker: { options: [{ model: 'project-glm', label: 'GLM 项目' }] } }));
+    expect(supportedModels('claude', project).map((m) => m.value)).toEqual(['default', 'project-glm']);
+    expect(supportedModels('claude').map((m) => m.value)).toEqual(['default', 'global-kimi']);
   });
 });

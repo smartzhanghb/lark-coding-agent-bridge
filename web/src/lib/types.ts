@@ -51,6 +51,7 @@ export interface ConfigView {
   meeting: MeetingConfig;
   access: {
     allowedUsers: string[];
+    blockedUsers: string[];
     allowedChats: string[];
     admins: string[];
     /** chat_id → per-chat @-mention override (overrides requireMentionInGroup). */

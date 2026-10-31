@@ -58,7 +58,7 @@ interface FakeLarkChannel {
   disconnect(): Promise<void>;
   getChatMode(chatId: string): Promise<'group' | 'topic'>;
   getConnectionStatus(): { state: 'connected'; reconnectAttempts: number };
-  send(chatId: string, content: unknown, options?: unknown): Promise<void>;
+  send(chatId: string, content: unknown, options?: unknown): Promise<{ messageId: string }>;
   stream(chatId: string, input: unknown, options?: unknown): Promise<void>;
 }
 
@@ -81,6 +81,20 @@ describe('bot identity injection into the agent adapter', () => {
 });
 
 describe('sender identity in bridge_context', () => {
+  it('adds a real mention to a human question reply through the live message handler', async () => {
+    const h = await createHarness();
+    h.profileConfig.preferences = { ...h.profileConfig.preferences, messageReply: 'text', messageReplyMigrated: true, cotMessages: 'off' };
+    h.agent.setEvents([{ type: 'text', delta: 'MENTION_REPLY' }, { type: 'done', terminationReason: 'normal' }]);
+    const sent = vi.spyOn(h.channel, 'send');
+    await startTestBridge(h);
+    await h.channel.handlers.message?.(message({ messageId: 'om_question', rawSenderType: 'user', content: 'question' }));
+    await waitFor(() => sent.mock.calls.some((call) => JSON.stringify(call[1]).includes('MENTION_REPLY')));
+    const reply = sent.mock.calls.find((call) => JSON.stringify(call[1]).includes('MENTION_REPLY'));
+    expect(reply?.[2]).toMatchObject({ replyTo: 'om_question', mentions: [{ openId: 'ou_user' }] });
+    const ctx = readSection(h.agent.runOptions[0]!.prompt, 'bridge_context') as { replyTargets: string[] };
+    expect(ctx.replyTargets).toEqual(['ou_user']);
+  });
+
   it('marks a bot sender via raw sender_type and injects botOpenId and mentions', async () => {
     const h = await createHarness();
     await startTestBridge(h);
@@ -337,7 +351,7 @@ function createFakeLarkChannel(): FakeLarkChannel & { handlers: MessageHandlerMa
     getConnectionStatus() {
       return { state: 'connected', reconnectAttempts: 0 };
     },
-    async send() {},
+    async send() { return { messageId: 'om_reply' }; },
     async stream(_chatId, input) {
       if (isMarkdownStreamInput(input)) {
         await input.markdown({ setContent: async () => {} });

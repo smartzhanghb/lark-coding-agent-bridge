@@ -178,3 +178,20 @@ function profileWithAccess(
     access,
   });
 }
+
+describe('blocked users', () => {
+  it('denies allowlisted users and admins in DMs, groups and both deployment modes', () => {
+    for (const mode of ['personal', 'team'] as const) {
+      const profile = profileWithAccess({ allowedUsers: ['ou_bad'], allowedChats: ['oc_group'], admins: ['ou_bad'], blockedUsers: ['ou_bad'] });
+      profile.mode = mode;
+      expect(canUseDm(profile, ownerControls, 'ou_bad')).toEqual({ ok: false, reason: 'blocked-user' });
+      expect(canUseGroup(profile, ownerControls, 'oc_group', 'ou_bad').ok).toBe(false);
+      expect(canRunAdminCommand(profile, ownerControls, 'ou_bad').ok).toBe(false);
+      expect(canUseDm(profile, ownerControls, 'ou_owner').ok).toBe(true);
+      const digest = accessPolicyDigest(profile.access);
+      profile.access.blockedUsers = [];
+      expect(accessPolicyDigest(profile.access)).not.toBe(digest);
+      expect(canUseDm(profile, ownerControls, 'ou_bad').ok).toBe(true);
+    }
+  });
+});

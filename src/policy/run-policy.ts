@@ -87,7 +87,7 @@ export type RunPolicyResult = RunPolicyAllow | RunPolicyReject;
 const DEFAULT_TTL_MS = 5 * 60 * 1000;
 
 export function evaluateRunPolicy(input: RunPolicyInput): RunPolicyResult {
-  if (!input.access.ok) {
+  if (!input.access.ok || input.profileConfig.access.blockedUsers?.includes(input.scope.actorId)) {
     return reject('access-denied', '当前用户无权发起运行。');
   }
 

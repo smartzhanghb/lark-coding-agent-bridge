@@ -1,3 +1,5 @@
+> 本仓库增量版本新增会话工作区管理与可靠性保护，操作、兼容和回退说明见 [会话工作区指南](docs/WORKSPACES.md)。
+
 # lark-channel-bridge
 
 把飞书 / Lark 消息和本地 Claude Code 或 Codex CLI 打通的轻量 bot。用一条命令启动，扫码绑定 PersonalAgent 应用，然后在飞书里和本机编程助手对话，让它读图、处理文件、改代码。
@@ -7,6 +9,8 @@
 关于能实现的效果，详情可以阅读[飞书文档](https://larkcommunity.feishu.cn/docx/OaRIdFIRFoLM3xxTmKwcetHqn5e)
 
 ## 主要功能
+
+- 群聊回复自动真实 @ 本轮提问的人；多人合并请求逐个去重，私聊与机器人消息不自动 @。支持文字、卡片与流式更新。业务工具可通过当前进程的 `LARK_REPLY_CONTEXT` 给直接发送的结果加提醒，该字段只用于通知，不用于授权。
 
 - 在飞书私聊直接发消息，或在群里 `@bot`，把任务转给本机 Claude Code / Codex CLI。
 - **流式卡片**：文本回复和工具调用实时更新在同一张卡片上。

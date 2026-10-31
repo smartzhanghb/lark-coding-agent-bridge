@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import type { AgentKind } from '../config/profile-schema';
 
 /**
@@ -43,9 +46,47 @@ const CODEX_MODELS: ModelOption[] = [
   { value: 'o3', label: 'o3' },
 ];
 
-/** The model picker options for a profile's agent kind. */
-export function supportedModels(agentKind: AgentKind): ModelOption[] {
-  return agentKind === 'codex' ? CODEX_MODELS : CLAUDE_MODELS;
+/** Read only model metadata, never expose credentials or execute the CLI. */
+export function supportedModels(agentKind: AgentKind, cwd?: string): ModelOption[] {
+  if (agentKind === 'codex') return [...CODEX_MODELS];
+  const settings: Record<string, unknown> = {};
+  const env: Record<string, unknown> = {};
+  const files = [join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'settings.json'),
+    ...(cwd ? [join(cwd, '.claude', 'settings.json'), join(cwd, '.claude', 'settings.local.json')] : [])];
+  for (const file of files) {
+    try {
+      const raw = JSON.parse(readFileSync(file, 'utf8'));
+      Object.assign(settings, raw);
+      Object.assign(env, raw.env);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return [CLAUDE_MODELS[0]!];
+    }
+  }
+  Object.assign(env, process.env);
+  const picker = settings.modelPicker as { options?: { model?: unknown; label?: unknown }[] } | undefined;
+  const configured = new Map<string, ModelOption>();
+  if (Array.isArray(picker?.options)) for (const option of picker.options) {
+    if (typeof option?.model !== 'string' || !validModelId(option.model) || option.model === DEFAULT_MODEL) continue;
+    configured.set(option.model, { value: option.model, label: typeof option.label === 'string' && option.label.trim() ? option.label : option.model });
+  }
+  // Custom menus replace the bridge's static Anthropic catalog. Keep the exact
+  // model id, including context suffixes such as [1M], for --model.
+  if (configured.size) return [CLAUDE_MODELS[0]!, ...configured.values()];
+  for (const alias of ['OPUS', 'SONNET', 'HAIKU', 'FABLE']) {
+    const value = env[`ANTHROPIC_DEFAULT_${alias}_MODEL`];
+    const label = env[`ANTHROPIC_DEFAULT_${alias}_MODEL_NAME`];
+    if (typeof value === 'string' && validModelId(value)) configured.set(value, { value, label: typeof label === 'string' && label ? label : value });
+  }
+  for (const value of [env.ANTHROPIC_MODEL, settings.model]) if (typeof value === 'string' && validModelId(value)) {
+    if (!configured.has(value)) configured.set(value, { value, label: value });
+  }
+  if (configured.size) return [CLAUDE_MODELS[0]!, ...configured.values()];
+  // A custom endpoint without model metadata must not advertise Anthropic models.
+  if (env.ANTHROPIC_BASE_URL || picker) return [CLAUDE_MODELS[0]!];
+  return [...CLAUDE_MODELS];
+}
+export function validModelId(value: string): boolean {
+  return value.length > 0 && value.length <= 256 && !/[\s\x00-\x1f]/.test(value) && !value.startsWith('-');
 }
 
 /** True when the selection means "use the agent default" (no `--model`). */
@@ -63,9 +104,10 @@ export function isDefaultModel(value: string | undefined): boolean {
 export function normalizeModelSelection(
   agentKind: AgentKind,
   value: string | undefined,
+  cwd?: string,
 ): string {
   if (isDefaultModel(value)) return DEFAULT_MODEL;
-  return supportedModels(agentKind).some((m) => m.value === value)
+  return supportedModels(agentKind, cwd).some((m) => m.value === value)
     ? (value as string)
     : DEFAULT_MODEL;
 }
@@ -77,13 +119,14 @@ export function normalizeModelSelection(
 export function resolveModelArg(
   agentKind: AgentKind,
   value: string | undefined,
+  cwd?: string,
 ): string | undefined {
-  const normalized = normalizeModelSelection(agentKind, value);
+  const normalized = normalizeModelSelection(agentKind, value, cwd);
   return normalized === DEFAULT_MODEL ? undefined : normalized;
 }
 
 /** Picker label for a stored value, for display in the saved-config card. */
-export function modelLabel(agentKind: AgentKind, value: string | undefined): string {
-  const normalized = normalizeModelSelection(agentKind, value);
-  return supportedModels(agentKind).find((m) => m.value === normalized)?.label ?? normalized;
+export function modelLabel(agentKind: AgentKind, value: string | undefined, cwd?: string): string {
+  const normalized = normalizeModelSelection(agentKind, value, cwd);
+  return supportedModels(agentKind, cwd).find((m) => m.value === normalized)?.label ?? normalized;
 }
