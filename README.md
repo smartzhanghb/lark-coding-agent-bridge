@@ -10,6 +10,8 @@ For a product walkthrough, see the [Feishu document](https://larkcommunity.feish
 
 ## What it does
 
+- Group replies automatically mention the human authors of the current request batch, without mentioning quoted authors or other bots. Direct messages stay unchanged. Text, card and streaming replies are covered; tools sending results directly can use the per-run `LARK_REPLY_CONTEXT` notification metadata (never an authorization credential).
+
 - Forwards Feishu / Lark messages to local Claude Code or Codex CLI. Send a DM directly, or `@bot` in a group.
 - **Streaming card**: text replies and tool calls update on one Lark card in real time.
 - **COT process messages**: optionally send a process message with agent progress text and tool calls, then send the final answer separately.

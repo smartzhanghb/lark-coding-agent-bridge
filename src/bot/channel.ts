@@ -1,4 +1,5 @@
 import { selectedModel } from '../workspace/selection';
+import { replyRecipients, withReplyMentions } from './reply-mention';
 import { stampWorkspaceMessage, workspaceMessageGeneration } from '../workspace/message-context';
 import { affectedScope } from '../workspace/service';
 import { selectedWorkspace } from '../workspace/selection';
@@ -641,7 +642,7 @@ type LogThreadModeOverride = (input: {
 
 async function intakeMessage(deps: IntakeDeps): Promise<void> {
   const {
-    channel,
+    channel: baseChannel,
     agent,
     sessions,
     sessionCatalog,
@@ -655,6 +656,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     executor,
     pool,
   } = deps;
+  const channel = withReplyMentions(baseChannel, [msg]);
   const preview = msg.content.length > 80 ? `${msg.content.slice(0, 80)}…` : msg.content;
   // Resolve scope (and underlying chat mode) once at intake — every
   // downstream consumer keys off these.
@@ -827,7 +829,7 @@ interface RunBatchDeps {
 
 async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const {
-    channel,
+    channel: baseChannel,
     executor,
     sessions,
     sessionCatalog,
@@ -842,6 +844,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     scope,
     mode,
   } = deps;
+  const channel = withReplyMentions(baseChannel, batch);
   if (batch.length === 0) return;
   const firstMsg = batch[0];
   const lastMsg = batch[batch.length - 1];
@@ -1888,6 +1891,7 @@ function buildPrompt(
       ...(mentions.length > 0 ? { mentions } : {}),
       ...(first.threadId ? { threadId: first.threadId } : {}),
       messageIds: batch.map((m) => m.messageId),
+      replyTargets: replyRecipients(batch, botIdentity?.openId).map((m) => m.openId!),
       source: 'im',
     },
     instructions:
