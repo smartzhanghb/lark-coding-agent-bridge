@@ -1,3 +1,4 @@
+import { join } from 'node:path';
 import { ClaudeAdapter } from '../agent/claude/adapter';
 import { CodexAdapter } from '../agent/codex/adapter';
 import { AgentPreflightError, type AgentAvailability } from '../agent/preflight';
@@ -49,7 +50,10 @@ export function createRuntimeAgent(
       larkChannel,
     });
   }
-  return new ClaudeAdapter({ larkChannel });
+  return new ClaudeAdapter({
+    settingsFile: join(appPaths.profileDir, 'claude-settings.json'),
+    larkChannel,
+  });
 }
 
 export async function checkRuntimeAgentAvailability(agent: AgentAdapter): Promise<AgentAvailability> {

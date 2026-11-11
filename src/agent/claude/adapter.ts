@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -20,6 +20,7 @@ import { translateEvent } from './stream-json';
 
 export interface ClaudeAdapterOptions {
   binary?: string;
+  settingsFile?: string;
   larkChannel?: LarkChannelEnvContext;
 }
 
@@ -30,11 +31,13 @@ export class ClaudeAdapter implements AgentAdapter {
   readonly displayName = 'Claude Code';
 
   private readonly binary: string;
+  private readonly settingsFile: string | undefined;
   private readonly larkChannel: LarkChannelEnvContext | undefined;
   private botIdentity: AgentBotIdentity | undefined;
 
   constructor(opts: ClaudeAdapterOptions = {}) {
     this.binary = opts.binary ?? 'claude';
+    this.settingsFile = opts.settingsFile;
     this.larkChannel = opts.larkChannel;
   }
 
@@ -80,6 +83,9 @@ export class ClaudeAdapter implements AgentAdapter {
       '--append-system-prompt-file',
       systemPromptFile.path,
     ];
+    if (this.settingsFile && existsSync(this.settingsFile)) {
+      args.push('--settings', this.settingsFile);
+    }
     if (opts.sessionId) args.push('--resume', opts.sessionId);
     if (opts.model) args.push('--model', opts.model);
 

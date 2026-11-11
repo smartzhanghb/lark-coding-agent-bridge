@@ -12,17 +12,33 @@ import { log } from '../core/logger';
  * are logged but never thrown — losing a decoration must not break the
  * actual reply flow.
  */
-export async function addWorkingReaction(
+export function addWorkingReaction(
   channel: LarkChannel,
   messageId: string,
 ): Promise<string | undefined> {
+  return addReaction(channel, messageId, 'Typing');
+}
+
+export function addCompletionReaction(
+  channel: LarkChannel,
+  messageId: string,
+): Promise<string | undefined> {
+  return addReaction(channel, messageId, 'DONE');
+}
+
+async function addReaction(
+  channel: LarkChannel,
+  messageId: string,
+  emojiType: 'Typing' | 'DONE',
+): Promise<string | undefined> {
   try {
-    const id = await channel.addReaction(messageId, 'Typing');
-    if (id) log.info('reaction', 'added', { messageId, reactionId: id });
+    const id = await channel.addReaction(messageId, emojiType);
+    if (id) log.info('reaction', 'added', { messageId, reactionId: id, emojiType });
     return id;
   } catch (err) {
     log.warn('reaction', 'add-failed', {
       messageId,
+      emojiType,
       err: err instanceof Error ? err.message : String(err),
     });
     return undefined;

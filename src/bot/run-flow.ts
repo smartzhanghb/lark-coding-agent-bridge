@@ -42,7 +42,6 @@ export interface StartRunFlowInput {
   expectedRunVersion?: number;
   recheckAccess?: () => AccessDecision;
   currentProfileConfig?: () => ProfileConfig;
-  onQueued?: (position: number) => void;
   observability?: {
     profile: string;
     agent: string;
@@ -164,7 +163,6 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
       actorIds: input.actorIds ?? [input.scope.actorId],
       policy,
       serializeDirectory: managed,
-      onQueued: input.onQueued,
       beforeSpawn: async () => {
         let currentProfile = input.currentProfileConfig?.() ?? input.profileConfig;
         if ((input.actorIds ?? [input.scope.actorId]).some((id) => currentProfile.access.blockedUsers?.includes(id)) || input.recheckAccess?.().ok === false) throw new RunRejected('binding-changed', '当前请求无法处理，请联系管理员。');

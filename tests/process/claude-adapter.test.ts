@@ -64,6 +64,26 @@ describe('ClaudeAdapter process contract', () => {
     expect(record.systemPrompt).not.toContain('__claude_cb');
     expect(record.argv).not.toContain('--resume');
     expect(record.argv).not.toContain('--model');
+    expect(record.argv).not.toContain('--settings');
+  });
+
+  it('passes the profile settings file and exact gateway model as separate CLI arguments', async () => {
+    const fake = await createFakeClaude({
+      lines: [{ type: 'result', session_id: 'sess-model' }],
+    });
+    cleanup.push(fake.dir);
+    const settingsFile = join(fake.dir, 'claude settings.json');
+    await writeFile(settingsFile, '{"modelOverrides":{"claude-sonnet-5":"gateway-glm"}}');
+
+    const run = new ClaudeAdapter({ binary: fake.path, settingsFile }).run({
+      runId: 'run-model',
+      prompt: 'hello',
+      cwd: fake.dir,
+      model: 'gateway-glm[1M]',
+    });
+    await collect(run.events);
+    const record = await readRecord(fake.recordPath);
+    expect(record.argv.slice(-4)).toEqual(['--settings', settingsFile, '--model', 'gateway-glm[1M]']);
   });
 
   it('injects the active bridge profile env into spawned runs', async () => {

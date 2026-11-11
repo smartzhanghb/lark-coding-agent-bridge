@@ -28,7 +28,6 @@ export interface SubmitRunInput {
   nowait?: boolean;
   serializeDirectory?: boolean;
   beforeSpawn?: () => Promise<void>;
-  onQueued?: (position: number) => void;
   observability?: {
     profile: string;
     agent: string;
@@ -102,7 +101,6 @@ export class RunExecutor {
     const controller = new AbortController();
     const job: { controller: AbortController; cwd: string; actorIds?: string[]; state: 'queued' | 'running'; stop?: () => Promise<void> } = { controller, cwd: input.policy.cwdRealpath, actorIds: input.actorIds, state: 'queued' };
     this.jobs.set(input.scopeId, job);
-    input.onQueued?.([...this.jobs.values()].filter((j) => j.state === 'queued' && j.cwd === job.cwd).length);
     let releaseDirectory: (() => void) | undefined;
     let releasePool: (() => void) | undefined;
     let released = false;

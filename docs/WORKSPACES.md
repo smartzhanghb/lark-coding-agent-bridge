@@ -20,6 +20,8 @@
 - `/resume`：仅所有者显式选择本聊天、同 Agent、同真实目录、同权限策略的历史；不读取整个本机目录的其他会话历史。
 - `/stop`：停止当前聊天运行、取消目录等待／进程池等待以及后续排队消息。
 
+普通任务在后台排队，启动时按回复模式显示进度或处理中表情。任务正常完成后，机器人在触发任务的消息上添加飞书的「完成」表情，并清除处理中表情。失败、超时或取消时只清除处理中表情。
+
 群中命令仍遵守现有 @ 规则。新私聊先向机器人发消息才会登记到控制台；群列表来自机器人可见群和接收到的消息。私聊名称取消息发送者可见名称，缺少名称时显示 ID。无需新增个人 OAuth 权限。
 
 未绑定的同事聊天不启动 Agent；所有者个人私聊可使用原默认目录。显式解绑后即便所有者也不回退到默认目录。目录失效或项目停用都停止执行，不改派目录。
@@ -56,6 +58,8 @@
 在本机控制台“项目与会话 → 编辑项目 → 运行模型”设置每个项目的模型。绑定同一项目的群、私聊和继承该项目的话题使用相同模型。默认继承 profile 的模型设置；选择“跟随默认”则让 CLI 决定。改变项目模型会使相关绑定代次失效，下一次开始新会话；有运行或排队任务时需先停止。保存、重启后保留选择。
 
 Claude 模型菜单读取 `CLAUDE_CONFIG_DIR/settings.json`（未设置时为 `~/.claude/settings.json`），再读取项目目录下 `.claude/settings.json` 和 `.claude/settings.local.json`。优先使用 `modelPicker.options` 的真实 ID 和标签（含 `[1M]` 等后缀）；无菜单时读取 `ANTHROPIC_DEFAULT_*_MODEL`、对应 `_NAME`、`ANTHROPIC_MODEL` 和 `model`。进程环境覆盖同名 settings 环境变量。自定义菜单或模型映射替换 Bridge 的内置 Claude 列表；仅配置中转地址而未配置模型时只提供跟随默认，不猜测模型名。配置文件无法解析时同样不提供猜测型号。页面刷新即可更新菜单，已保存的模型若从配置消失，运行会被拒绝而非静默切换。新增项目可先保存目录再编辑，以读取项目内的模型菜单。
+
+若 Claude Code 对网关模型输出 `unrecognized_model`，可在 `~/.lark-channel/profiles/<profile>/claude-settings.json`（自定义根目录时使用 `LARK_CHANNEL_HOME`）设置 [`modelOverrides`](https://code.claude.com/docs/en/model-config#override-model-ids-per-version)。Bridge 启动该 profile 的 Claude Code 时会通过 `--settings` 传入文件。映射值填写网关模型 ID 的基础部分，工作区仍按原模型 ID 传递 `[1M]` 等后缀。
 
 会话行的“上次 CLI 报告”来自 Claude Code 的初始化事件，和请求模型分开显示；它只证明 CLI 报告的型号，不能证明中转服务下游供应商实际使用哪个模型。此次不查询供应商模型列表，也不读取或向网页暴露 API Key。
 

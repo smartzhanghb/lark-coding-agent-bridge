@@ -70,7 +70,7 @@ import { PendingQueue } from './pending-queue';
 import { ProcessPool } from './process-pool';
 import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quote';
 import { lookupMessageThreadId } from './thread-id';
-import { addWorkingReaction, removeReaction } from './reaction';
+import { addCompletionReaction, addWorkingReaction, removeReaction } from './reaction';
 import { fetchKnownChats } from './lark-info';
 import type { AppPaths } from '../config/app-paths';
 import {
@@ -1014,9 +1014,6 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       }
       return firstMsg.chatType === 'p2p' ? canUseDm(controls.profileConfig, controls, firstMsg.senderId) : canUseGroup(controls.profileConfig, controls, firstMsg.chatId, firstMsg.senderId);
     },
-    onQueued: controls.profileConfig.workspaces.managedBindings ? (position) => {
-      void channel.send(chatId, { markdown: `项目「${workspaces.selection(scope).project?.name ?? '个人默认工作区'}」：任务已进入队列（当前目录第 ${position} 项）。可用 /stop 取消。` }, sendOpts).catch((err) => log.warn('queue', 'notice-failed', { err: String(err) }));
-    } : undefined,
     stopGraceMs: getAgentStopGraceMs(controls.cfg),
     observability: {
       profile: controls.profile,
@@ -1119,6 +1116,14 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // never let that outbound API call block agent event draining.
   const reactionPromise =
     cotEnabled || replyMode === 'card' ? undefined : addWorkingReaction(channel, lastMsg.messageId);
+  let completed = false;
+  const renderRun = async (flush: (state: RunState) => Promise<void>): Promise<RunState> => {
+    const result = await processAgentStream(
+      handle, eventStream, scope, idleTimeoutMs, recordSession, flush,
+    );
+    completed = result.completed;
+    return result.state;
+  };
 
   try {
     if (cotEnabled) {
@@ -1139,14 +1144,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         const cotDone = consumeCotEvents(execution.subscribe(), cotPublisher, {
           detail: cotMessages,
         });
-        const finalState = await processAgentStream(
-          handle,
-          eventStream,
-          scope,
-          idleTimeoutMs,
-          recordSession,
-          async () => {},
-        );
+        const finalState = await renderRun(async () => {});
         await cotDone;
         if (cotPublisher.degradedReason) {
           await sendCotDegradedNotice({
@@ -1195,20 +1193,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           sendOpts,
         ),
       );
-      const renderDone = processAgentStream(
-        handle,
-        eventStream,
-        scope,
-        idleTimeoutMs,
-        recordSession,
-        async (state) => {
-          latestState = state;
-          if (shouldOpenProgressStream(filterForPrefs(state))) progress.ensureOpen();
-          if (cardCtrl) {
-            await cardCtrl.update(renderCard(filterForPrefs(state), cardRenderOptions));
-          }
-        },
-      );
+      const renderDone = renderRun(async (state) => {
+        latestState = state;
+        if (shouldOpenProgressStream(filterForPrefs(state))) progress.ensureOpen();
+        if (cardCtrl) {
+          await cardCtrl.update(renderCard(filterForPrefs(state), cardRenderOptions));
+        }
+      });
       try {
         await awaitRenderAwareStream({
           mode: replyMode,
@@ -1260,20 +1251,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           sendOpts,
         ),
       );
-      const renderDone = processAgentStream(
-        handle,
-        eventStream,
-        scope,
-        idleTimeoutMs,
-        recordSession,
-        async (state) => {
-          latestState = state;
-          if (shouldOpenProgressStream(filterForPrefs(state))) progress.ensureOpen();
-          if (markdownCtrl) {
-            await markdownCtrl.setContent(renderText(filterForPrefs(state)));
-          }
-        },
-      );
+      const renderDone = renderRun(async (state) => {
+        latestState = state;
+        if (shouldOpenProgressStream(filterForPrefs(state))) progress.ensureOpen();
+        if (markdownCtrl) {
+          await markdownCtrl.setContent(renderText(filterForPrefs(state)));
+        }
+      });
       try {
         await awaitRenderAwareStream({
           mode: replyMode,
@@ -1308,14 +1292,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       // text mode: drain the agent stream without sending anything during
       // the run, then post the final rendered text once as a plain markdown
       // (msg_type=post) message — no card, no streaming, no typewriter.
-      const finalState = await processAgentStream(
-        handle,
-        eventStream,
-        scope,
-        idleTimeoutMs,
-        recordSession,
-        async () => {},
-      );
+      const finalState = await renderRun(async () => {});
       await sendFinalReply({
         channel,
         chatId,
@@ -1330,10 +1307,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       });
     }
   } catch (err) {
+    completed = false;
     log.fail('stream', err);
   } finally {
     activePolicyFingerprints.delete(scope);
-    scheduleWorkingReactionCleanup(channel, lastMsg.messageId, reactionPromise);
+    scheduleFinalReaction(channel, lastMsg.messageId, reactionPromise, completed);
   }
 }
 
@@ -1601,7 +1579,7 @@ async function processAgentStream(
   idleTimeoutMs: number | undefined,
   recordSession: (event: AgentEvent) => void,
   flush: (state: RunState) => Promise<void>,
-): Promise<RunState> {
+): Promise<{ state: RunState; completed: boolean }> {
   const runStart = Date.now();
   let state: RunState = initialState;
 
@@ -1696,6 +1674,7 @@ async function processAgentStream(
   // watchdog or interrupt could land, don't clobber it — that real terminal
   // wins. This avoids "claude finished but flush was slow → timer fired
   // mid-flush → user sees 'idle_timeout' on a successful run".
+  const completed = state.terminal === 'done';
   if (state.terminal === 'running') {
     if (idleFired) {
       state = markIdleTimeout(state, Math.round(idleTimeoutMs! / 60_000));
@@ -1711,7 +1690,7 @@ async function processAgentStream(
   if (handle.interrupted) {
     await handle.run.stop();
   }
-  return state;
+  return { state, completed };
 }
 
 async function awaitRenderAwareStream(input: {
@@ -1809,38 +1788,22 @@ async function runFallbackReply(
   }
 }
 
-function scheduleWorkingReactionCleanup(
+function scheduleFinalReaction(
   channel: LarkChannel,
   messageId: string,
   reactionPromise: Promise<string | undefined> | undefined,
+  completed: boolean,
 ): void {
-  if (!reactionPromise) return;
+  const cleanup = reactionPromise?.then(async (reactionId) => {
+    if (reactionId) await removeReaction(channel, messageId, reactionId);
+  });
+  if (!completed) return;
 
-  void (async () => {
-    const reactionResult = reactionPromise.then(
-      (reactionId) => ({ ok: true as const, reactionId }),
-      (err) => ({ ok: false as const, err }),
-    );
-    const settled = await Promise.race([
-      reactionResult,
-      delay(REACTION_CLEANUP_GRACE_MS).then(() => undefined),
-    ]);
-
-    if (!settled) {
-      log.warn('reaction', 'cleanup-deferred', {
-        messageId,
-        graceMs: REACTION_CLEANUP_GRACE_MS,
-      });
-      void reactionResult.then((result) => {
-        if (!result.ok || !result.reactionId) return;
-        void removeReaction(channel, messageId, result.reactionId);
-      });
-      return;
-    }
-
-    if (!settled.ok || !settled.reactionId) return;
-    await removeReaction(channel, messageId, settled.reactionId);
-  })();
+  // A slow Typing request must not hold back the completion reaction.
+  const ready = cleanup
+    ? Promise.race([cleanup, delay(REACTION_CLEANUP_GRACE_MS)])
+    : Promise.resolve();
+  void ready.then(() => addCompletionReaction(channel, messageId));
 }
 
 function delay(ms: number): Promise<void> {
