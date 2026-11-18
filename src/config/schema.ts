@@ -78,6 +78,7 @@ export type CotMessagesMode = 'off' | 'brief' | 'detailed';
 export interface AppAccess {
   /** open_id allowlist for DM senders. Group senders are gated by chat. */
   allowedUsers?: string[];
+  blockedUsers?: string[];
   /** chat_id allowlist for groups the bot responds in. Does not apply to p2p. */
   allowedChats?: string[];
   /** open_id list with admin privileges. Gates sensitive commands

@@ -68,6 +68,20 @@ describe('hash media attachment resolver', () => {
     expect((await stat(freshPath)).isFile()).toBe(true);
   });
 
+  it('keeps an active attachment through collection and removes it after release', async () => {
+    const root = await tempDir();
+    const cache = new MediaCache(fakeChannel(Buffer.from('leased')), root);
+    const lease = {};
+    const [file] = await cache.resolve([{ messageId: 'm', resource: { type: 'file', fileKey: 'f' } as never }], {}, lease);
+    const old = new Date(Date.now() - 10_000);
+    await utimes(file!.absPath, old, old);
+    await cache.collect(1000);
+    expect(await readFile(file!.absPath, 'utf8')).toBe('leased');
+    cache.release(lease);
+    await cache.collect(1000);
+    expect(await readdir(root)).toEqual([]);
+  });
+
   it('enforces cacheMaxBytes without deleting files from the current resolution', async () => {
     const root = await tempDir();
     const oldPath = join(root, 'old.bin');

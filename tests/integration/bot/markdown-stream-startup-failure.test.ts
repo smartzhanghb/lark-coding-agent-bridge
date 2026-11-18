@@ -1,5 +1,5 @@
 import type { NormalizedMessage } from '@larksuite/channel';
-import { realpath } from 'node:fs/promises';
+import { readdir, readFile, realpath, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AgentEvent } from '../../../src/agent/types.js';
@@ -30,6 +30,7 @@ vi.mock('@larksuite/channel', async (importOriginal) => {
 import { startChannel } from '../../../src/bot/channel.js';
 
 interface MessageHandlerMap {
+  reconnected?: () => void;
   message?: (msg: NormalizedMessage) => Promise<void> | void;
 }
 
@@ -50,6 +51,7 @@ interface FakeLarkChannel {
       v1: {
         message: {
           get: ReturnType<typeof vi.fn>;
+          reply?: ReturnType<typeof vi.fn>;
         };
         messageReaction: {
           create: ReturnType<typeof vi.fn>;
@@ -82,6 +84,82 @@ afterEach(async () => {
 });
 
 describe('markdown stream startup failures', () => {
+  it('skips the queue notice and replaces the working reaction on successful completion', async () => {
+    const h = await createHarness({
+      agentKind: 'claude',
+      managedBindings: true,
+      messageReply: 'text',
+      events: [
+        { type: 'text', delta: 'FINISHED' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+    });
+    await startTestBridge(h);
+    await h.channel.handlers.message?.(message('om_command', 'run'));
+    const reactions = h.channel.rawClient.im.v1.messageReaction;
+    await waitFor(() => reactions.delete.mock.calls.length > 0);
+
+    expect(h.channel.sent).toEqual([
+      expect.objectContaining({
+        content: { markdown: 'FINISHED' },
+        options: { replyTo: 'om_command' },
+      }),
+    ]);
+    await vi.waitFor(() => expect(reactions.create).toHaveBeenCalledTimes(2));
+    expect(reactions.create).toHaveBeenNthCalledWith(1, {
+      path: { message_id: 'om_command' },
+      data: { reaction_type: { emoji_type: 'Typing' } },
+    });
+    expect(reactions.create).toHaveBeenNthCalledWith(2, {
+      path: { message_id: 'om_command' },
+      data: { reaction_type: { emoji_type: 'DONE' } },
+    });
+    expect(reactions.delete.mock.invocationCallOrder[0]).toBeLessThan(
+      reactions.create.mock.invocationCallOrder[1]!,
+    );
+  });
+
+  it('reconnects and resends only the saved Claude answer after printing once', async () => {
+    const h = await createHarness({
+      agentKind: 'claude', messageReply: 'markdown',
+      events: [
+        { type: 'text', delta: '我正在处理。' },
+        { type: 'tool_use', id: 't', name: 'print', input: { file: 'label' } },
+        { type: 'tool_result', id: 't', output: 'private tool output', isError: false },
+        { type: 'text', delta: '标签已打印。' },
+        { type: 'final_text', content: '标签已打印。' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      stream: async () => { throw new Error('offline'); },
+    });
+    const reply = vi.fn().mockRejectedValueOnce(new Error('ECONNREFUSED'))
+      .mockResolvedValue({ data: { message_id: 'receipt' } });
+    h.channel.rawClient.im.v1.message.reply = reply;
+    const bridge = await startChannel({
+      cfg: h.profileConfig, agent: h.agent, sessions: h.sessions, workspaces: h.workspaces,
+      controls: h.controls, appPaths: { mediaDir: join(h.tmp.profile, 'media'),
+        keystoreSaltFile: join(h.tmp.profile, 'salt'), secretsFile: join(h.tmp.profile, 'secrets') },
+    });
+    cleanups.push(() => bridge.disconnect());
+    expect(sdkMock.createLarkChannel).toHaveBeenCalledWith(expect.objectContaining({
+      keepalive: expect.objectContaining({ enabled: true }),
+    }));
+    await h.channel.handlers.message?.(message('om_print', 'print'));
+    await waitFor(() => h.channel.rawClient.im.v1.messageReaction.delete.mock.calls.length > 0);
+    const dir = join(h.tmp.profile, 'answers', h.profileConfig.accounts.app.id);
+    const file = join(dir, (await readdir(dir))[0]!);
+    const pending = JSON.parse(await readFile(file, 'utf8'));
+    expect(pending.packets[0].content).toContain('标签已打印。');
+    expect(pending.packets[0].content).not.toMatch(/private tool output|我正在处理|label/);
+    expect(h.channel.rawClient.im.v1.messageReaction.create).toHaveBeenCalledTimes(1);
+    await writeFile(file, JSON.stringify({ ...pending, nextAttempt: 0 }));
+    h.channel.handlers.reconnected?.();
+    await waitFor(() => h.channel.rawClient.im.v1.messageReaction.create.mock.calls.length === 2);
+    expect(reply).toHaveBeenCalledTimes(2);
+    expect(reply.mock.calls[0]).toEqual(reply.mock.calls[1]);
+    expect(h.agent.runOptions).toHaveLength(1);
+  });
+
   it('does not leave the IM queue blocked when the agent exits before stream producer starts', async () => {
     const h = await createHarness();
     await startTestBridge(h);
@@ -95,6 +173,12 @@ describe('markdown stream startup failures', () => {
     expect(h.channel.rawClient.im.v1.messageReaction.delete).toHaveBeenCalledWith(
       expect.objectContaining({
         path: { message_id: 'om_first', reaction_id: 'reaction_1' },
+      }),
+    );
+    expect(h.channel.rawClient.im.v1.messageReaction.create).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: { message_id: 'om_first' },
+        data: { reaction_type: { emoji_type: 'DONE' } },
       }),
     );
     expect(lastMarkdown(h.channel)).toContain('agent 失败');
@@ -436,6 +520,7 @@ async function createHarness(options: {
   /** One run's events, or one array per run. */
   events?: FakeAgentEvents;
   messageReply?: 'card' | 'markdown' | 'text';
+  managedBindings?: boolean;
   /** Codex holds its answer back for a dedicated final reply; Claude streams it. */
   agentKind?: 'claude' | 'codex';
 } = {}): Promise<{
@@ -464,17 +549,24 @@ async function createHarness(options: {
     codex: {
       binaryPath: '/usr/local/bin/codex',
     },
-    ...(options.messageReply ? { preferences: { messageReply: options.messageReply } } : {}),
+    ...(options.messageReply ? {
+      preferences: { messageReply: options.messageReply, messageReplyMigrated: true },
+    } : {}),
   });
   const profileConfig = {
     ...baseProfileConfig,
     workspaces: {
       ...baseProfileConfig.workspaces,
       default: workspace,
+      managedBindings: options.managedBindings ?? false,
     },
   };
   const sessions = new SessionStore(join(tmp.profile, 'sessions.json'));
   const workspaces = new WorkspaceStore(join(tmp.profile, 'workspaces.json'));
+  if (options.managedBindings) {
+    const project = await workspaces.saveProject({ name: '项目 A', cwd: workspace });
+    await workspaces.bind('oc_dm', project.id, workspaces.generation('oc_dm'));
+  }
   const agent = new FakeAgentAdapter({
     id: 'codex',
     displayName: 'Codex',

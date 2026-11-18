@@ -9,6 +9,13 @@ vi.mock('node:child_process', async (importOriginal) => ({
   spawnSync: mocks.spawnSync,
 }));
 
+// This suite simulates macOS even on Windows, where os.userInfo().uid is -1.
+// Keep the launchd identity deterministic instead of leaking the host OS into it.
+vi.mock('node:os', async (importOriginal) => {
+  const os = await importOriginal<typeof import('node:os')>();
+  return { ...os, userInfo: () => ({ ...os.userInfo(), uid: 501 }) };
+});
+
 const { getServiceAdapter } = await import('../../../src/daemon/service-adapter');
 const { launchAgentLabel } = await import('../../../src/daemon/paths');
 

@@ -27,7 +27,7 @@ export async function runUi(opts: RunUiOptions = {}): Promise<void> {
       console.log(sidecar.url);
       return;
     }
-    console.log(`打开控制台：${sidecar.url}`);
+    console.log(`打开控制台：${new URL(sidecar.url).origin}`);
     openBrowser(sidecar.url);
     return;
   }
@@ -60,10 +60,10 @@ function openBrowser(url: string): void {
   try {
     const child = spawnProcess(cmd as string, args as string[], { stdio: 'ignore' });
     child.on('error', () => {
-      console.log(`若浏览器未自动打开，请手动访问上面的地址。`);
+      console.log(`若浏览器未自动打开，请用 lark-channel-bridge ui --print 获取登录链接。`);
     });
     child.unref?.();
   } catch {
-    console.log('无法自动打开浏览器，请手动访问上面的地址。');
+    console.log('无法自动打开浏览器，请用 lark-channel-bridge ui --print 获取登录链接。');
   }
 }

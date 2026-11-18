@@ -21,7 +21,6 @@ import type { AppConfig } from '../../config/schema';
 import { isComplete } from '../../config/schema';
 import { configureLogger, gcOldLogs, log, reportError } from '../../core/logger';
 import { loadTelemetryAdapter, telemetry } from '../../core/telemetry';
-import { gcMediaCache } from '../../media/cache';
 import { startUiServer } from '../../ui/server';
 import { readUiSidecar, removeUiSidecar, writeUiSidecar } from '../../ui/sidecar';
 import type { UiServerHandle } from '../../ui/types';
@@ -79,8 +78,6 @@ process.on('uncaughtException', (err) => {
   log.fail('process', err, { kind: 'uncaughtException' });
   reportError(err, { kind: 'uncaughtException' });
 });
-
-const MEDIA_GC_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 export interface StartOptions {
   config?: string;
@@ -189,7 +186,7 @@ async function runSupervisorConsole(opts: StartOptions): Promise<void> {
     const sidecar = await readUiSidecar(appPaths.hostUiFile);
     console.log(
       sidecar
-        ? `控制面已在运行：${sidecar.url}`
+        ? `控制面已在运行：${new URL(sidecar.url).origin}（用 lark-channel-bridge ui 打开）`
         : '控制面已在运行（另一个 supervisor 进程持有锁）。',
     );
     return;
@@ -210,7 +207,7 @@ async function runSupervisorConsole(opts: StartOptions): Promise<void> {
   try {
     uiServer = await startUiServer({ supervisor, version: pkg.version, rootDir: appPaths.rootDir });
     await writeUiSidecar(appPaths.hostUiFile, uiServer, new Date().toISOString());
-    console.log(`✓ 控制台：${uiServer.url}`);
+    console.log(`✓ 控制台：${new URL(uiServer.url).origin}（用 lark-channel-bridge ui 打开）`);
   } catch (err) {
     log.warn('ui', 'server-start-failed', { err: String(err) });
   }

@@ -1,3 +1,8 @@
+import { selectedModel } from '../workspace/selection';
+import { mentionCard, replyRecipients, withReplyMentions } from './reply-mention';
+import { stampWorkspaceMessage, workspaceMessageGeneration } from '../workspace/message-context';
+import { affectedScope } from '../workspace/service';
+import { selectedWorkspace } from '../workspace/selection';
 import type {
   LarkChannel,
   LarkChannelOptions,
@@ -60,12 +65,12 @@ import { ChatModeCache, type ChatMode } from './chat-mode-cache';
 import { handleCommentMention } from './comments';
 import { recordRunSessionEvent, startRunFlow } from './run-flow';
 import { commandSessionCatalogIdentity } from './session-catalog-identity';
-import { startKeepalive } from './keepalive';
+import { AnswerOutbox, answerPackets } from './answer-outbox';
 import { PendingQueue } from './pending-queue';
 import { ProcessPool } from './process-pool';
 import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quote';
 import { lookupMessageThreadId } from './thread-id';
-import { addWorkingReaction, removeReaction } from './reaction';
+import { addCompletionReaction, addWorkingReaction, removeReaction } from './reaction';
 import { fetchKnownChats } from './lark-info';
 import type { AppPaths } from '../config/app-paths';
 import {
@@ -254,10 +259,10 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       streamThrottleMs: 400,
     },
     // SDK 1.65.0-alpha.3+ knobs.
+    keepalive: { enabled: true, onUnrecoverable: err => log.fail('ws', err, { step: 'transport-reconnect' }) },
     wsConfig: {
-      // 3s liveness watchdog: if no inbound message arrives within 3s after
-      // the last ping, SDK presumes connection dead and forces a reconnect.
-      pingTimeout: 3,
+      // Tolerate short local network stalls; preserve the host's proven 15s setting.
+      pingTimeout: 15,
     },
     // 8s handshake timeout (replaces hardcoded 15s). Fast-fail + fast-retry
     // beats slow-fail in unstable networks.
@@ -270,6 +275,12 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   };
 
   const channel = createLarkChannel(opts);
+  const outbox = deps.appPaths && new AnswerOutbox(
+    join(dirname(deps.appPaths.mediaDir), 'answers', encodeURIComponent(cfg.accounts.app.id)), channel,
+    target => workspaces.generation(target.scope) === target.generation && target.authors.every(id =>
+      (target.dm ? canUseDm(controls.profileConfig, controls, id)
+        : canUseGroup(controls.profileConfig, controls, target.chatId, id)).ok),
+  );
   const media = new MediaCache(channel, deps.appPaths?.mediaDir);
 
   // Pending → run handoff: while a run is active on a chat, block its pending
@@ -310,7 +321,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           sessions,
           sessionCatalog,
           workspaces,
-          media,
+          media, outbox,
           batch,
           controls,
           cotClient,
@@ -323,11 +334,14 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       } catch (err) {
         log.fail('flush', err);
       } finally {
+        media.release(batch);
         pending.unblock(scope);
         log.info('flush', 'end');
       }
     });
   });
+  controls.workspaceRuntime = { workspaces, sessions, sessionCatalog, executor, activeRuns, pending, changing: new Set() };
+
 
   // Counter for stdout reconnect escalation; reset on `reconnected`.
   let consecutiveReconnects = 0;
@@ -408,6 +422,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
         log.info('ws', 'reconnected');
       }
       consecutiveReconnects = 0;
+      outbox?.wake();
     },
     // Classify common WS errors into the `network` phase so /doctor and grep
     // can find them without scanning generic `ws.fail` entries.
@@ -465,6 +480,9 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     controls.meeting = meetingManager;
   }
 
+  const cleanMedia = () => media.collect(controls.profileConfig.attachments.cacheTtlMs)
+    .catch(err => log.fail('media', err, { step: 'ttl' }));
+  if (deps.appPaths) await cleanMedia();
   await channel.connect();
   const ownerRefresh = createOwnerRefreshController({
     controls,
@@ -472,6 +490,9 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     appId: cfg.accounts.app.id,
   });
   await ownerRefresh.start();
+  outbox?.start();
+  const mediaTimer = deps.appPaths ? setInterval(cleanMedia, 15 * 60_000) : undefined;
+  mediaTimer?.unref();
   const knownChatsRefresh = startKnownChatsRefreshTimer(channel, controls);
 
   const identity = channel.botIdentity;
@@ -493,32 +514,21 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   });
   console.log('正在监听消息。按 Ctrl+C 退出。\n');
 
-  // App-level keepalive: 15s probe + wake-up detection + HTTP reachability.
-  // Defense-in-depth — the SDK's pingTimeout watchdog handles half-dead WS,
-  // this catches anything that the SDK misses (silent state stuck, etc.).
-  const probeDomain =
-    cfg.accounts.app.tenant === 'lark'
-      ? 'https://open.larksuite.com'
-      : 'https://open.feishu.cn';
-  const keepalive = startKeepalive({
-    channel,
-    domain: probeDomain,
-    forceReconnect: () => controls.restart(),
-  });
-
   return {
     channel,
     disconnect: async () => {
       activeRuns.pauseNewRuns('bridge-disconnect');
       ownerRefresh.stop();
       knownChatsRefresh.stop();
-      keepalive.stop();
+      clearInterval(mediaTimer);
+      await outbox?.stop();
       // Stop meeting timers but stay in the meetings: /reconnect tears the
       // channel down and rebuilds it, and auto-leaving every meeting on a
       // reconnect would be surprising.
       meetingManager?.dispose();
       controls.meeting = undefined;
       pending.cancelAll();
+      await executor.cancelAll();
       const [disconnectResult, stopAllResult, ...flushResults] = await Promise.allSettled([
         channel.disconnect(),
         activeRuns.stopAll(),
@@ -635,7 +645,7 @@ type LogThreadModeOverride = (input: {
 
 async function intakeMessage(deps: IntakeDeps): Promise<void> {
   const {
-    channel,
+    channel: baseChannel,
     agent,
     sessions,
     sessionCatalog,
@@ -649,6 +659,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     executor,
     pool,
   } = deps;
+  const channel = withReplyMentions(baseChannel, [msg]);
   const preview = msg.content.length > 80 ? `${msg.content.slice(0, 80)}…` : msg.content;
   // Resolve scope (and underlying chat mode) once at intake — every
   // downstream consumer keys off these.
@@ -712,6 +723,9 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
       sender: msg.senderId.slice(-6),
       reason: accessDecision.reason,
     });
+    if (accessDecision.reason === 'blocked-user' && (msg.chatType === 'p2p' || msg.mentionedBot)) {
+      await channel.send(msg.chatId, { markdown: '当前请求无法处理，请联系管理员。' }, { replyTo: msg.messageId });
+    }
     if (msg.chatType !== 'p2p' && accessDecision.reason === 'denied-chat' && msg.mentionedBot) {
       void sendNonAllowedGroupHint(channel, msg.chatId, msg.messageId).catch((err) =>
         log.warn('intake', 'non-allowed-hint-failed', { err: String(err) }),
@@ -736,6 +750,14 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   ) {
     log.info('intake', 'skip-no-mention', { scope, chatType: msg.chatType });
     return;
+  }
+
+  if (controls.profileConfig.workspaces.managedBindings) {
+    await workspaces.observe({ id: scope, chatId: msg.chatId, type: chatMode, lastActivity: Date.now(), ownerDm: chatMode === 'p2p' && msg.senderId === controls.botOwnerId,
+      name: chatMode === 'p2p' ? msg.senderName || '私聊' : controls.knownChats?.find((c) => c.id === msg.chatId)?.name });
+    if ([...(controls.workspaceRuntime?.changing ?? [])].some((target) => target === '*' || affectedScope(target, scope))) {
+      await channel.send(msg.chatId, { markdown: '正在切换工作区，请稍后重新发送。' }, { replyTo: msg.messageId }); return;
+    }
   }
 
   // A merge_forward whose sub-messages the SDK could not fetch (transient
@@ -783,6 +805,10 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     return;
   }
 
+  if (controls.profileConfig.workspaces.managedBindings && !selectedWorkspace({ workspaces, profileConfig: controls.profileConfig, scope, ownerDm: chatMode === 'p2p' && msg.senderId === controls.botOwnerId })) {
+    await channel.send(msg.chatId, { markdown: '当前聊天未绑定可用项目，请等待机器人所有者绑定。' }, { replyTo: msg.messageId, ...(threadId ? { replyInThread: true } : {}) }); return;
+  }
+  stampWorkspaceMessage(emsg, `${workspaces.generation(scope)}|${executor.version(scope)}`);
   const size = pending.push(scope, emsg);
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
 }
@@ -794,6 +820,7 @@ interface RunBatchDeps {
   sessionCatalog?: SessionCatalog;
   workspaces: WorkspaceStore;
   media: MediaCache;
+  outbox?: AnswerOutbox;
   batch: NormalizedMessage[];
   controls: Controls;
   cotClient: CotClient;
@@ -806,7 +833,7 @@ interface RunBatchDeps {
 
 async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const {
-    channel,
+    channel: baseChannel,
     executor,
     sessions,
     sessionCatalog,
@@ -821,6 +848,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     scope,
     mode,
   } = deps;
+  const channel = withReplyMentions(baseChannel, batch);
   if (batch.length === 0) return;
   const firstMsg = batch[0];
   const lastMsg = batch[batch.length - 1];
@@ -828,11 +856,15 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
 
   const chatId = firstMsg.chatId;
   const threadId = firstMsg.threadId;
+  const generation = workspaces.generation(scope);
+  const runVersion = executor.version(scope);
+  const queuedContext = workspaceMessageGeneration(firstMsg);
+  if (controls.profileConfig.workspaces.managedBindings && queuedContext && queuedContext !== `${generation}|${runVersion}`) return;
 
   const resourceItems = batch.flatMap((m) =>
     m.resources.map((r) => ({ messageId: m.messageId, resource: r })),
   );
-  const attachments = await media.resolve(resourceItems, controls.profileConfig.attachments);
+  const attachments = await media.resolve(resourceItems, controls.profileConfig.attachments, batch);
   if (attachments.length > 0) {
     log.info('media', 'resolved', { count: attachments.length });
     for (const attachment of attachments) {
@@ -901,15 +933,16 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // changed. `requestedModel` (the `--model` value, or undefined for default)
   // is reused below to log requested-vs-actual against the init event.
   const agentKind = controls.profileConfig.agentKind;
-  const modelPref = controls.profileConfig.preferences.model;
-  const modelSelection = normalizeModelSelection(agentKind, modelPref);
-  const requestedModel = resolveModelArg(agentKind, modelPref);
+  const modelPref = selectedModel({ workspaces, profileConfig: controls.profileConfig, scope });
+  const modelCwd = selectedWorkspace({ workspaces, profileConfig: controls.profileConfig, scope, ownerDm: mode === 'p2p' && firstMsg.senderId === controls.botOwnerId });
+  const modelSelection = normalizeModelSelection(agentKind, modelPref, modelCwd);
+  const requestedModel = resolveModelArg(agentKind, modelPref, modelCwd);
   const prevModel = lastRunModelByScope.get(scope);
   const modelSwitched = prevModel !== undefined && prevModel !== modelSelection;
   lastRunModelByScope.set(scope, modelSelection);
   const extraInstructions = modelSwitched
     ? [
-        `用户刚把本会话使用的模型切换为「${modelLabel(agentKind, modelPref)}」。` +
+        `用户刚把本会话使用的模型切换为「${modelLabel(agentKind, modelPref, modelCwd)}」。` +
           '之前的对话里可能提到别的模型,请以当前模型为准;若被问到你用的是什么模型,据此回答。',
       ]
     : undefined;
@@ -959,12 +992,14 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     controls.profileConfig.agentKind === 'codex'
       ? codexCapability(controls.profileConfig)
       : claudeCapability(controls.profileConfig);
+  if (controls.profileConfig.workspaces.managedBindings && workspaces.generation(scope) !== generation) return;
   const flow = await startRunFlow({
     scopeId: scope,
     scope: scopeContext,
     prompt,
     attachments: attachments.map(toPolicyAttachment),
     access: accessDecision,
+    actorIds: [...new Set(batch.map((m) => m.senderId))],
     capability,
     profileConfig: controls.profileConfig,
     sessions,
@@ -972,6 +1007,17 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     workspaces,
     executor,
     now: Date.now(),
+    expectedRunVersion: runVersion,
+    currentProfileConfig: () => controls.profileConfig,
+    ownerDm: mode === 'p2p' && firstMsg.senderId === controls.botOwnerId,
+    recheckAccess: () => {
+      if (controls.workspaceRuntime?.changing.size) return { ok: false, reason: 'denied-user' };
+      for (const m of batch) {
+        const access = m.chatType === 'p2p' ? canUseDm(controls.profileConfig, controls, m.senderId) : canUseGroup(controls.profileConfig, controls, m.chatId, m.senderId);
+        if (!access.ok) return access;
+      }
+      return firstMsg.chatType === 'p2p' ? canUseDm(controls.profileConfig, controls, firstMsg.senderId) : canUseGroup(controls.profileConfig, controls, firstMsg.chatId, firstMsg.senderId);
+    },
     stopGraceMs: getAgentStopGraceMs(controls.cfg),
     observability: {
       profile: controls.profile,
@@ -1008,6 +1054,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       capability,
       policy: flow.policy,
       event: evt,
+      workspaces: controls.profileConfig.workspaces.managedBindings ? workspaces : undefined,
+      generation,
     });
     if (evt.type === 'system' && evt.sessionId) {
       log.info('session', 'set', { sessionId: evt.sessionId });
@@ -1072,6 +1120,31 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // never let that outbound API call block agent event draining.
   const reactionPromise =
     cotEnabled || replyMode === 'card' ? undefined : addWorkingReaction(channel, lastMsg.messageId);
+  let completed = false;
+  const renderRun = async (flush: (state: RunState) => Promise<void>): Promise<RunState> => {
+    const result = await processAgentStream(
+      handle, eventStream, scope, idleTimeoutMs, recordSession, flush,
+    );
+    completed = result.completed;
+    return result.state;
+  };
+
+  // Journal only the terminal answer and its original reply destination.
+  const deliver = async (state: RunState): Promise<void> => {
+    if (!deps.outbox) {
+      await sendFinalReply({ channel, chatId, scope, state, replyMode, sendOpts, cardRenderOptions });
+      return;
+    }
+    const answer = finalAnswerOnlyState(state);
+    const body = renderText(answer);
+    if (!body.trim()) return;
+    const mentions = replyRecipients(batch, baseChannel.botIdentity?.openId);
+    const card = replyMode === 'card' ? mentionCard(renderCard(answer, cardRenderOptions), mentions) : undefined;
+    await deps.outbox.send({
+      ...sendOpts, chatId, scope, generation, dm: firstMsg.chatType === 'p2p',
+      authors: [...new Set(batch.map(msg => msg.senderId))], completed,
+    }, answerPackets(body, mentions, card));
+  };
 
   try {
     if (cotEnabled) {
@@ -1092,14 +1165,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         const cotDone = consumeCotEvents(execution.subscribe(), cotPublisher, {
           detail: cotMessages,
         });
-        const finalState = await processAgentStream(
-          handle,
-          eventStream,
-          scope,
-          idleTimeoutMs,
-          recordSession,
-          async () => {},
-        );
+        const finalState = await renderRun(async () => {});
         await cotDone;
         if (cotPublisher.degradedReason) {
           await sendCotDegradedNotice({
@@ -1110,15 +1176,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             reason: cotPublisher.degradedReason,
           });
         }
-        await sendFinalReply({
-          channel,
-          chatId,
-          scope,
-          state: finalAnswerOnlyState(finalState),
-          replyMode,
-          sendOpts,
-          cardRenderOptions,
-        });
+        await deliver(finalAnswerOnlyState(finalState));
         return;
       }
       log.warn('cot', 'fallback-existing-reply', { reason: 'create-disabled' });
@@ -1127,6 +1185,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     if (replyMode === 'card') {
       let latestState: RunState = initialState;
       let producerStarted = false;
+      let progressUpdateFailed = false;
       let cardCtrl:
         | { update(next: object | ((current: object) => object)): Promise<void> }
         | undefined;
@@ -1148,34 +1207,30 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           sendOpts,
         ),
       );
-      const renderDone = processAgentStream(
-        handle,
-        eventStream,
-        scope,
-        idleTimeoutMs,
-        recordSession,
-        async (state) => {
-          latestState = state;
-          if (shouldOpenProgressStream(filterForPrefs(state))) progress.ensureOpen();
-          if (cardCtrl) {
+      const renderDone = renderRun(async (state) => {
+        latestState = state;
+        if (shouldOpenProgressStream(filterForPrefs(state))) progress.ensureOpen();
+        if (cardCtrl) {
+          try {
             await cardCtrl.update(renderCard(filterForPrefs(state), cardRenderOptions));
+          } catch (err) {
+            cardCtrl = undefined;
+            progressUpdateFailed = true;
+            log.fail('stream', err, { step: 'update' });
           }
-        },
-      );
+        }
+      });
       try {
         await awaitRenderAwareStream({
           mode: replyMode,
           progress,
           renderDone,
           producerStarted: () => producerStarted,
-          fallback: async (state) => {
-            if (controls.profileConfig.agentKind === 'codex') return;
-            if (renderText(filterForPrefs(state)).trim() === '') return;
-            await channel.send(
-              chatId,
-              { card: renderCard(filterForPrefs(state), cardRenderOptions) },
-              sendOpts,
-            );
+          updateFailed: () => progressUpdateFailed,
+          requireReceipt: Boolean(deps.outbox) && controls.profileConfig.agentKind === 'claude',
+          waitForReceipt: controls.profileConfig.agentKind === 'claude',
+          fallback: async state => {
+            if (controls.profileConfig.agentKind === 'claude') await deliver(finalAnswerOnlyState(state));
           },
         });
       } catch (err) {
@@ -1184,19 +1239,12 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       }
       await recallIfEmptyStreamedReply(channel, progress, filterForPrefs(latestState), scope);
       if (controls.profileConfig.agentKind === 'codex') {
-        await sendFinalReply({
-          channel,
-          chatId,
-          scope,
-          state: finalReplyState(progress, filterForPrefs(latestState)),
-          replyMode,
-          sendOpts,
-          cardRenderOptions,
-        });
+        await deliver(finalReplyState(progress, filterForPrefs(latestState)));
       }
     } else if (replyMode === 'markdown') {
       let latestState: RunState = initialState;
       let producerStarted = false;
+      let progressUpdateFailed = false;
       let markdownCtrl: { setContent(markdown: string): Promise<void> } | undefined;
       const progress = createLazyProgressStream(scope, replyMode, () =>
         channel.stream(
@@ -1213,32 +1261,30 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           sendOpts,
         ),
       );
-      const renderDone = processAgentStream(
-        handle,
-        eventStream,
-        scope,
-        idleTimeoutMs,
-        recordSession,
-        async (state) => {
-          latestState = state;
-          if (shouldOpenProgressStream(filterForPrefs(state))) progress.ensureOpen();
-          if (markdownCtrl) {
+      const renderDone = renderRun(async (state) => {
+        latestState = state;
+        if (shouldOpenProgressStream(filterForPrefs(state))) progress.ensureOpen();
+        if (markdownCtrl) {
+          try {
             await markdownCtrl.setContent(renderText(filterForPrefs(state)));
+          } catch (err) {
+            markdownCtrl = undefined;
+            progressUpdateFailed = true;
+            log.fail('stream', err, { step: 'update' });
           }
-        },
-      );
+        }
+      });
       try {
         await awaitRenderAwareStream({
           mode: replyMode,
           progress,
           renderDone,
           producerStarted: () => producerStarted,
-          fallback: async (state) => {
-            if (controls.profileConfig.agentKind === 'codex') return;
-            const body = renderText(filterForPrefs(state));
-            if (body.trim()) {
-              await channel.send(chatId, { markdown: body }, sendOpts);
-            }
+          updateFailed: () => progressUpdateFailed,
+          requireReceipt: Boolean(deps.outbox) && controls.profileConfig.agentKind === 'claude',
+          waitForReceipt: controls.profileConfig.agentKind === 'claude',
+          fallback: async state => {
+            if (controls.profileConfig.agentKind === 'claude') await deliver(finalAnswerOnlyState(state));
           },
         });
       } catch (err) {
@@ -1247,46 +1293,22 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       }
       await recallIfEmptyStreamedReply(channel, progress, filterForPrefs(latestState), scope);
       if (controls.profileConfig.agentKind === 'codex') {
-        await sendFinalReply({
-          channel,
-          chatId,
-          scope,
-          state: finalReplyState(progress, filterForPrefs(latestState)),
-          replyMode,
-          sendOpts,
-          cardRenderOptions,
-        });
+        await deliver(finalReplyState(progress, filterForPrefs(latestState)));
       }
     } else {
       // text mode: drain the agent stream without sending anything during
       // the run, then post the final rendered text once as a plain markdown
       // (msg_type=post) message — no card, no streaming, no typewriter.
-      const finalState = await processAgentStream(
-        handle,
-        eventStream,
-        scope,
-        idleTimeoutMs,
-        recordSession,
-        async () => {},
-      );
-      await sendFinalReply({
-        channel,
-        chatId,
-        scope,
-        state:
-          controls.profileConfig.agentKind === 'codex'
-            ? finalAnswerOnlyState(filterForPrefs(finalState))
-            : filterForPrefs(finalState),
-        replyMode,
-        sendOpts,
-        cardRenderOptions,
-      });
+      const finalState = await renderRun(async () => {});
+      await deliver(controls.profileConfig.agentKind === 'codex'
+        ? finalAnswerOnlyState(finalState) : filterForPrefs(finalState));
     }
   } catch (err) {
+    completed = false;
     log.fail('stream', err);
   } finally {
     activePolicyFingerprints.delete(scope);
-    scheduleWorkingReactionCleanup(channel, lastMsg.messageId, reactionPromise);
+    scheduleFinalReaction(channel, lastMsg.messageId, reactionPromise, completed);
   }
 }
 
@@ -1554,7 +1576,7 @@ async function processAgentStream(
   idleTimeoutMs: number | undefined,
   recordSession: (event: AgentEvent) => void,
   flush: (state: RunState) => Promise<void>,
-): Promise<RunState> {
+): Promise<{ state: RunState; completed: boolean }> {
   const runStart = Date.now();
   let state: RunState = initialState;
 
@@ -1649,6 +1671,7 @@ async function processAgentStream(
   // watchdog or interrupt could land, don't clobber it — that real terminal
   // wins. This avoids "claude finished but flush was slow → timer fired
   // mid-flush → user sees 'idle_timeout' on a successful run".
+  const completed = state.terminal === 'done';
   if (state.terminal === 'running') {
     if (idleFired) {
       state = markIdleTimeout(state, Math.round(idleTimeoutMs! / 60_000));
@@ -1664,7 +1687,7 @@ async function processAgentStream(
   if (handle.interrupted) {
     await handle.run.stop();
   }
-  return state;
+  return { state, completed };
 }
 
 async function awaitRenderAwareStream(input: {
@@ -1672,10 +1695,18 @@ async function awaitRenderAwareStream(input: {
   progress: LazyProgressStream;
   renderDone: Promise<RunState>;
   producerStarted: () => boolean;
+  waitForReceipt: boolean;
+  requireReceipt: boolean;
+  updateFailed: () => boolean;
   fallback: (state: RunState) => Promise<void>;
 }): Promise<void> {
   const streamResult = input.progress.settled.then(
-    () => ({ kind: 'stream' as const, ok: true as const }),
+    result => {
+      if (input.requireReceipt && !(result as { messageId?: string } | undefined)?.messageId?.trim()) {
+        return { kind: 'stream' as const, ok: false as const, err: new Error('stream missing message receipt') };
+      }
+      return { kind: 'stream' as const, ok: true as const };
+    },
     (err) => ({ kind: 'stream' as const, ok: false as const, err }),
   );
   const renderResult = input.renderDone.then(
@@ -1697,6 +1728,7 @@ async function awaitRenderAwareStream(input: {
   if (first.kind === 'stream') {
     const rendered = await renderResult;
     if (!rendered.ok) throw rendered.err;
+    if (input.updateFailed()) await runFallbackReply(input.mode, rendered.state, input.fallback);
     return;
   }
 
@@ -1724,6 +1756,11 @@ async function awaitRenderAwareStream(input: {
         mode: input.mode,
         graceMs: STREAM_TERMINAL_GRACE_MS,
       });
+      if (input.waitForReceipt) {
+        const late = await streamResult;
+        if (!late.ok || input.updateFailed()) await runFallbackReply(input.mode, first.state, input.fallback);
+        return;
+      }
       void streamResult.then((result) => {
         if (!result.ok) {
           log.fail('stream', result.err, { mode: input.mode, step: 'stream-terminal-late' });
@@ -1740,11 +1777,12 @@ async function awaitRenderAwareStream(input: {
     return;
   }
 
+  if (terminal.ok && input.updateFailed()) await runFallbackReply(input.mode, first.state, input.fallback);
   if (!terminal.ok) {
     // A stream that failed before producing anything delivered nothing, so the
     // reply still has to go out; one that failed later already showed its
     // content and the error is the caller's to handle.
-    if (input.producerStarted()) throw terminal.err;
+    if (input.producerStarted() && !input.waitForReceipt) throw terminal.err;
     log.fail('stream', terminal.err, { mode: input.mode, step: 'stream' });
     await runFallbackReply(input.mode, first.state, input.fallback);
   }
@@ -1759,41 +1797,26 @@ async function runFallbackReply(
     await fallback(state);
   } catch (err) {
     log.fail('stream', err, { mode, step: 'fallback' });
+    throw err;
   }
 }
 
-function scheduleWorkingReactionCleanup(
+function scheduleFinalReaction(
   channel: LarkChannel,
   messageId: string,
   reactionPromise: Promise<string | undefined> | undefined,
+  completed: boolean,
 ): void {
-  if (!reactionPromise) return;
+  const cleanup = reactionPromise?.then(async (reactionId) => {
+    if (reactionId) await removeReaction(channel, messageId, reactionId);
+  });
+  if (!completed) return;
 
-  void (async () => {
-    const reactionResult = reactionPromise.then(
-      (reactionId) => ({ ok: true as const, reactionId }),
-      (err) => ({ ok: false as const, err }),
-    );
-    const settled = await Promise.race([
-      reactionResult,
-      delay(REACTION_CLEANUP_GRACE_MS).then(() => undefined),
-    ]);
-
-    if (!settled) {
-      log.warn('reaction', 'cleanup-deferred', {
-        messageId,
-        graceMs: REACTION_CLEANUP_GRACE_MS,
-      });
-      void reactionResult.then((result) => {
-        if (!result.ok || !result.reactionId) return;
-        void removeReaction(channel, messageId, result.reactionId);
-      });
-      return;
-    }
-
-    if (!settled.ok || !settled.reactionId) return;
-    await removeReaction(channel, messageId, settled.reactionId);
-  })();
+  // A slow Typing request must not hold back the completion reaction.
+  const ready = cleanup
+    ? Promise.race([cleanup, delay(REACTION_CLEANUP_GRACE_MS)])
+    : Promise.resolve();
+  void ready.then(() => addCompletionReaction(channel, messageId));
 }
 
 function delay(ms: number): Promise<void> {
@@ -1844,6 +1867,7 @@ function buildPrompt(
       ...(mentions.length > 0 ? { mentions } : {}),
       ...(first.threadId ? { threadId: first.threadId } : {}),
       messageIds: batch.map((m) => m.messageId),
+      replyTargets: replyRecipients(batch, botIdentity?.openId).map((m) => m.openId!),
       source: 'im',
     },
     instructions:

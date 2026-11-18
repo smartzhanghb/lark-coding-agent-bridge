@@ -3,6 +3,7 @@ import { createReadStream } from 'node:fs';
 import { mkdir, readdir, rename, rm, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { LarkChannel, ResourceDescriptor } from '@larksuite/channel';
+import { DirectoryQueue } from '../runtime/directory-queue';
 import { paths } from '../config/paths';
 import { log } from '../core/logger';
 import {
@@ -25,6 +26,10 @@ export interface ResourceRequest {
   resource: ResourceDescriptor;
 }
 
+// Explicit account reconnects can briefly share one profile cache.
+const cacheWrites = new DirectoryQueue();
+const leasedFiles = new Map<object, ReadonlySet<string>>();
+
 export class MediaCache {
   private readonly channel: LarkChannel;
   private readonly rootDir: string;
@@ -37,8 +42,35 @@ export class MediaCache {
   async resolve(
     items: ResourceRequest[],
     options: MediaResolveOptions = {},
+    lease?: object,
   ): Promise<LocalAttachment[]> {
     if (items.length === 0) return [];
+    const unlock = await cacheWrites.acquire(this.rootDir);
+    try {
+      return await this.download(items, options, lease);
+    } finally {
+      unlock();
+    }
+  }
+
+  release(lease: object): void {
+    leasedFiles.delete(lease);
+  }
+
+  async collect(maxAgeMs: number): Promise<void> {
+    const unlock = await cacheWrites.acquire(this.rootDir);
+    try {
+      await gcMediaCache(maxAgeMs, this.rootDir, this.protectedPaths());
+    } finally {
+      unlock();
+    }
+  }
+
+  private protectedPaths(): Set<string> {
+    return new Set([...leasedFiles.values()].flatMap(paths => [...paths]));
+  }
+
+  private async download(items: ResourceRequest[], options: MediaResolveOptions, lease?: object): Promise<LocalAttachment[]> {
     await mkdir(this.rootDir, { recursive: true });
 
     const candidates: AttachmentCandidate[] = [];
@@ -51,17 +83,13 @@ export class MediaCache {
       }
     }
     const normalized = normalizeAttachments(candidates, options);
-    await removeRejectedResolvedFiles(normalized);
+    const accepted = new Set(normalized.filter(a => a.decision === 'accepted').map(a => a.absPath));
+    if (lease) leasedFiles.set(lease, accepted);
+    const protectedPaths = this.protectedPaths();
+    for (const path of accepted) protectedPaths.add(path);
+    await removeRejectedResolvedFiles(normalized.filter(a => !protectedPaths.has(a.absPath)));
     if (typeof options.cacheMaxBytes === 'number') {
-      await enforceCacheMaxBytes(
-        this.rootDir,
-        options.cacheMaxBytes,
-        new Set(
-          normalized
-            .filter((attachment) => attachment.decision === 'accepted')
-            .map((attachment) => attachment.absPath),
-        ),
-      );
+      await enforceCacheMaxBytes(this.rootDir, options.cacheMaxBytes, protectedPaths);
     }
     return normalized;
   }
@@ -128,6 +156,7 @@ export class MediaCache {
 export async function gcMediaCache(
   maxAgeMs: number,
   root: string = paths.mediaDir,
+  protectedPaths: ReadonlySet<string> = new Set(),
 ): Promise<void> {
   try {
     await stat(root);
@@ -140,7 +169,7 @@ export async function gcMediaCache(
   for (const p of files) {
     try {
       const st = await stat(p);
-      if (st.isFile() && st.mtimeMs < cutoff) {
+      if (!protectedPaths.has(p) && st.isFile() && st.mtimeMs < cutoff) {
         await rm(p);
         removed++;
       }

@@ -19,6 +19,8 @@ export interface BridgePromptContext {
   mentions?: BridgePromptMention[];
   threadId?: string;
   messageIds?: string[];
+  /** Human authors of the current batch, for result notifications only. */
+  replyTargets?: string[];
   source: BridgePromptSource;
 }
 

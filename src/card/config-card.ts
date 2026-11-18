@@ -66,14 +66,14 @@ function chatList(chatIds: string[], knownChats: KnownChat[]): string {
 export function configFormCard(opts: ConfigFormOpts): object {
   const teamMode = opts.mode === 'team';
   const teamOverrideNote =
-    '\n\n_⚠️ 团队版已开启：本项被覆盖 —— 身份强制为「只允许应用身份」、访问控制不生效。切回个人版后恢复。_';
+    '\n\n_⚠️ 团队版已开启：本项被覆盖 —— 身份强制为「只允许应用身份」、白名单不生效，封禁仍生效。切回个人版后恢复。_';
   const accessElements: object[] = [
     ...(teamMode
       ? [
           {
             tag: 'markdown',
             content:
-              '_⚠️ **团队版已开启**：访问控制暂不生效 —— 任何人 @ bot 都能使用（管理命令仍限 owner/管理员）。切回个人版后以下白名单恢复生效。_',
+              '_⚠️ **团队版已开启**：白名单暂不生效 —— 未被封禁的用户 @ bot 可使用（管理命令仍限 owner/管理员）。切回个人版后以下白名单恢复生效。_',
           },
           { tag: 'hr' },
         ]

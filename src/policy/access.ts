@@ -20,6 +20,7 @@ export interface AccessDecision {
     | 'allowed-admin'
     | 'allowed-chat'
     | 'comment-mention'
+    | 'blocked-user'
     | 'denied-user'
     | 'denied-chat'
     | 'denied-admin';
@@ -36,6 +37,7 @@ export function canUseDm(
   senderId: string,
 ): AccessDecision {
   if (isCreator(controls, senderId)) return allow('owner');
+  if (profile.access.blockedUsers?.includes(senderId)) return deny('blocked-user');
   // Team mode opens up *usage* to everyone — no allowlist gating. Admin
   // commands stay owner/admin-gated via canRunAdminCommand (unchanged).
   if (profile.mode === 'team') return allow('allowed-team');
@@ -51,6 +53,7 @@ export function canUseGroup(
   senderId: string,
 ): AccessDecision {
   if (isCreator(controls, senderId)) return allow('owner');
+  if (profile.access.blockedUsers?.includes(senderId)) return deny('blocked-user');
   if (profile.mode === 'team') return allow('allowed-team');
   if (profile.access.admins.includes(senderId)) return allow('allowed-admin');
   if (profile.access.allowedChats.includes(chatId)) return allow('allowed-chat');
@@ -77,6 +80,7 @@ export function canRunAdminCommand(
   senderId: string,
 ): AccessDecision {
   if (isCreator(controls, senderId)) return allow('owner');
+  if (profile.access.blockedUsers?.includes(senderId)) return deny('blocked-user');
   if (profile.access.admins.includes(senderId)) return allow('allowed-admin');
   return deny('denied-admin');
 }

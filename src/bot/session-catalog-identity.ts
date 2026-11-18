@@ -1,3 +1,4 @@
+import { selectedWorkspace, generationFingerprint } from '../workspace/selection';
 import type { NormalizedMessage } from '@larksuite/channel';
 import { claudeCapability, codexCapability } from '../agent/capability';
 import type { Controls } from '../commands';
@@ -16,8 +17,7 @@ export async function commandSessionCatalogIdentity(input: {
   controls: Controls;
   access: AccessDecision;
 }): Promise<SessionCatalogIdentity | undefined> {
-  const requestedCwd =
-    input.workspaces.cwdFor(input.scope) ?? input.controls.profileConfig.workspaces.default;
+  const requestedCwd = selectedWorkspace({ workspaces: input.workspaces, profileConfig: input.controls.profileConfig, scope: input.scope, ownerDm: input.mode === 'p2p' && input.msg.senderId === input.controls.botOwnerId });
   if (!requestedCwd) return undefined;
   const workspace = await resolveWorkingDirectory(requestedCwd);
   if (!workspace.ok) return undefined;
@@ -48,6 +48,6 @@ export async function commandSessionCatalogIdentity(input: {
     scopeId: input.scope,
     agentId: capability.agentId,
     cwdRealpath: workspace.cwdRealpath,
-    policyFingerprint: policy.policyFingerprint,
+    policyFingerprint: input.controls.profileConfig.workspaces.managedBindings ? generationFingerprint(policy.policyFingerprint, input.workspaces.generation(input.scope)) : policy.policyFingerprint,
   };
 }

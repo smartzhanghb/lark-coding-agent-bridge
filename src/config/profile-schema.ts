@@ -19,6 +19,7 @@ export type { AccessMode, PermissionConfig, PermissionSource };
 
 export interface ProfileAccess {
   allowedUsers: string[];
+  blockedUsers?: string[];
   allowedChats: string[];
   admins: string[];
   requireMentionInGroup: boolean;
@@ -154,6 +155,7 @@ export interface ProfileConfig {
   preferences: Omit<AppPreferences, 'access' | 'requireMentionInGroup'>;
   access: ProfileAccess;
   workspaces: {
+    managedBindings?: boolean;
     default?: string;
   };
   sandbox: SandboxConfig;
@@ -229,6 +231,7 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
     preferences?: (AppPreferences & { access?: Partial<ProfileAccess> }) | undefined;
     access?: Partial<ProfileAccess>;
     workspaces?: {
+      managedBindings?: unknown;
       default?: unknown;
       // Legacy workspace authorization fields are accepted for config
       // compatibility only; normalizeWorkspaces drops them.
@@ -345,6 +348,7 @@ function normalizeAccess(
   const chatRequireMention = normalizeChatMentionMap(access?.chatRequireMention);
   return {
     allowedUsers: stringArray(access?.allowedUsers),
+    ...(Array.isArray(access?.blockedUsers) ? { blockedUsers: stringArray(access.blockedUsers) } : {}),
     allowedChats: stringArray(access?.allowedChats),
     admins: stringArray(access?.admins),
     requireMentionInGroup: access?.requireMentionInGroup ?? legacyRequireMentionInGroup ?? true,
@@ -364,6 +368,7 @@ function normalizeChatMentionMap(input: unknown): Record<string, boolean> {
 }
 
 function normalizeWorkspaces(input: {
+  managedBindings?: unknown;
   default?: unknown;
   trusted?: unknown;
   trustedRoots?: unknown;
@@ -372,7 +377,7 @@ function normalizeWorkspaces(input: {
   const defaultWorkspace = typeof input?.default === 'string' && input.default.trim()
     ? input.default.trim()
     : undefined;
-  return defaultWorkspace ? { default: defaultWorkspace } : {};
+  return { ...(defaultWorkspace ? { default: defaultWorkspace } : {}), ...(input?.managedBindings === true ? { managedBindings: true } : {}) };
 }
 
 function normalizeCodex(input: CodexConfig & { flags?: unknown }): CodexConfig {

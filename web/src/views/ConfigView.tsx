@@ -96,7 +96,7 @@ export function ConfigView({ profile }: { profile: string }) {
     }
   }
 
-  async function access(action: "add" | "remove", kind: "user" | "admin" | "chat", id: string) {
+  async function access(action: "add" | "remove", kind: "user" | "admin" | "chat" | "blocked", id: string) {
     if (!id.trim()) return;
     try {
       const acc = await apiPost<ConfigData["access"]>(
@@ -196,8 +196,12 @@ export function ConfigView({ profile }: { profile: string }) {
         <CardHeader><CardTitle>访问控制</CardTitle></CardHeader>
         <CardContent className="space-y-4">
           {team && (
-            <p className="text-xs text-primary">团队版下访问控制不生效（任何人可用）；以下配置保留，切回个人版后恢复。</p>
+            <p className="text-xs text-primary">团队版开放使用，封禁名单仍然生效。白名单配置保留，切回个人版后恢复。</p>
           )}
+          <AccessList label="封禁用户（私聊和群聊均生效）" placeholder="ou_..." ids={cfg.access.blockedUsers ?? []}
+            onAdd={(id) => access("add", "blocked", id)} onRemove={(id) => access("remove", "blocked", id)} />
+          <p className="text-xs text-muted-foreground">仅本机控制台可管理。被封禁用户收到统一的无法处理提示，不显示名单或内部原因。封禁会取消包含该用户的运行和排队任务。</p>
+          <Separator />
           <AccessList label="允许私聊的用户（open_id）" placeholder="ou_..." ids={cfg.access.allowedUsers}
             onAdd={(id) => access("add", "user", id)} onRemove={(id) => access("remove", "user", id)} />
           <Separator />
