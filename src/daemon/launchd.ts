@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, open, rm, writeFile } from 'node:fs/promises';
 import { userInfo } from 'node:os';
 import { dirname } from 'node:path';
 import {
@@ -87,6 +87,11 @@ export async function writePlist(profile: string, runArgs: string[] = ['run']): 
   const plistPath = launchAgentPlistPath(profile);
   await mkdir(dirname(plistPath), { recursive: true });
   await mkdir(daemonLogDir(profile), { recursive: true });
+  for (const path of [daemonStdoutPath(profile), daemonStderrPath(profile)]) {
+    const file = await open(path, 'a', 0o600);
+    await file.close();
+    await chmod(path, 0o600);
+  }
   await writeFile(plistPath, content, 'utf8');
 }
 

@@ -1,5 +1,5 @@
 import { selectedModel } from '../workspace/selection';
-import { replyRecipients, withReplyMentions } from './reply-mention';
+import { mentionCard, replyRecipients, withReplyMentions } from './reply-mention';
 import { stampWorkspaceMessage, workspaceMessageGeneration } from '../workspace/message-context';
 import { affectedScope } from '../workspace/service';
 import { selectedWorkspace } from '../workspace/selection';
@@ -65,7 +65,7 @@ import { ChatModeCache, type ChatMode } from './chat-mode-cache';
 import { handleCommentMention } from './comments';
 import { recordRunSessionEvent, startRunFlow } from './run-flow';
 import { commandSessionCatalogIdentity } from './session-catalog-identity';
-import { startKeepalive } from './keepalive';
+import { AnswerOutbox, answerPackets } from './answer-outbox';
 import { PendingQueue } from './pending-queue';
 import { ProcessPool } from './process-pool';
 import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quote';
@@ -259,6 +259,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       streamThrottleMs: 400,
     },
     // SDK 1.65.0-alpha.3+ knobs.
+    keepalive: { enabled: true, onUnrecoverable: err => log.fail('ws', err, { step: 'transport-reconnect' }) },
     wsConfig: {
       // Tolerate short local network stalls; preserve the host's proven 15s setting.
       pingTimeout: 15,
@@ -274,6 +275,12 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   };
 
   const channel = createLarkChannel(opts);
+  const outbox = deps.appPaths && new AnswerOutbox(
+    join(dirname(deps.appPaths.mediaDir), 'answers', encodeURIComponent(cfg.accounts.app.id)), channel,
+    target => workspaces.generation(target.scope) === target.generation && target.authors.every(id =>
+      (target.dm ? canUseDm(controls.profileConfig, controls, id)
+        : canUseGroup(controls.profileConfig, controls, target.chatId, id)).ok),
+  );
   const media = new MediaCache(channel, deps.appPaths?.mediaDir);
 
   // Pending → run handoff: while a run is active on a chat, block its pending
@@ -314,7 +321,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           sessions,
           sessionCatalog,
           workspaces,
-          media,
+          media, outbox,
           batch,
           controls,
           cotClient,
@@ -327,6 +334,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       } catch (err) {
         log.fail('flush', err);
       } finally {
+        media.release(batch);
         pending.unblock(scope);
         log.info('flush', 'end');
       }
@@ -414,6 +422,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
         log.info('ws', 'reconnected');
       }
       consecutiveReconnects = 0;
+      outbox?.wake();
     },
     // Classify common WS errors into the `network` phase so /doctor and grep
     // can find them without scanning generic `ws.fail` entries.
@@ -471,6 +480,9 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     controls.meeting = meetingManager;
   }
 
+  const cleanMedia = () => media.collect(controls.profileConfig.attachments.cacheTtlMs)
+    .catch(err => log.fail('media', err, { step: 'ttl' }));
+  if (deps.appPaths) await cleanMedia();
   await channel.connect();
   const ownerRefresh = createOwnerRefreshController({
     controls,
@@ -478,6 +490,9 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     appId: cfg.accounts.app.id,
   });
   await ownerRefresh.start();
+  outbox?.start();
+  const mediaTimer = deps.appPaths ? setInterval(cleanMedia, 15 * 60_000) : undefined;
+  mediaTimer?.unref();
   const knownChatsRefresh = startKnownChatsRefreshTimer(channel, controls);
 
   const identity = channel.botIdentity;
@@ -499,26 +514,14 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   });
   console.log('正在监听消息。按 Ctrl+C 退出。\n');
 
-  // App-level keepalive: 15s probe + wake-up detection + HTTP reachability.
-  // Defense-in-depth — the SDK's pingTimeout watchdog handles half-dead WS,
-  // this catches anything that the SDK misses (silent state stuck, etc.).
-  const probeDomain =
-    cfg.accounts.app.tenant === 'lark'
-      ? 'https://open.larksuite.com'
-      : 'https://open.feishu.cn';
-  const keepalive = startKeepalive({
-    channel,
-    domain: probeDomain,
-    forceReconnect: () => controls.restart(),
-  });
-
   return {
     channel,
     disconnect: async () => {
       activeRuns.pauseNewRuns('bridge-disconnect');
       ownerRefresh.stop();
       knownChatsRefresh.stop();
-      keepalive.stop();
+      clearInterval(mediaTimer);
+      await outbox?.stop();
       // Stop meeting timers but stay in the meetings: /reconnect tears the
       // channel down and rebuilds it, and auto-leaving every meeting on a
       // reconnect would be surprising.
@@ -817,6 +820,7 @@ interface RunBatchDeps {
   sessionCatalog?: SessionCatalog;
   workspaces: WorkspaceStore;
   media: MediaCache;
+  outbox?: AnswerOutbox;
   batch: NormalizedMessage[];
   controls: Controls;
   cotClient: CotClient;
@@ -860,7 +864,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const resourceItems = batch.flatMap((m) =>
     m.resources.map((r) => ({ messageId: m.messageId, resource: r })),
   );
-  const attachments = await media.resolve(resourceItems, controls.profileConfig.attachments);
+  const attachments = await media.resolve(resourceItems, controls.profileConfig.attachments, batch);
   if (attachments.length > 0) {
     log.info('media', 'resolved', { count: attachments.length });
     for (const attachment of attachments) {
@@ -1125,6 +1129,23 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     return result.state;
   };
 
+  // Journal only the terminal answer and its original reply destination.
+  const deliver = async (state: RunState): Promise<void> => {
+    if (!deps.outbox) {
+      await sendFinalReply({ channel, chatId, scope, state, replyMode, sendOpts, cardRenderOptions });
+      return;
+    }
+    const answer = finalAnswerOnlyState(state);
+    const body = renderText(answer);
+    if (!body.trim()) return;
+    const mentions = replyRecipients(batch, baseChannel.botIdentity?.openId);
+    const card = replyMode === 'card' ? mentionCard(renderCard(answer, cardRenderOptions), mentions) : undefined;
+    await deps.outbox.send({
+      ...sendOpts, chatId, scope, generation, dm: firstMsg.chatType === 'p2p',
+      authors: [...new Set(batch.map(msg => msg.senderId))], completed,
+    }, answerPackets(body, mentions, card));
+  };
+
   try {
     if (cotEnabled) {
       const cotPublisher = new CotPublisher({
@@ -1155,15 +1176,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             reason: cotPublisher.degradedReason,
           });
         }
-        await sendFinalReply({
-          channel,
-          chatId,
-          scope,
-          state: finalAnswerOnlyState(finalState),
-          replyMode,
-          sendOpts,
-          cardRenderOptions,
-        });
+        await deliver(finalAnswerOnlyState(finalState));
         return;
       }
       log.warn('cot', 'fallback-existing-reply', { reason: 'create-disabled' });
@@ -1172,6 +1185,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     if (replyMode === 'card') {
       let latestState: RunState = initialState;
       let producerStarted = false;
+      let progressUpdateFailed = false;
       let cardCtrl:
         | { update(next: object | ((current: object) => object)): Promise<void> }
         | undefined;
@@ -1197,7 +1211,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         latestState = state;
         if (shouldOpenProgressStream(filterForPrefs(state))) progress.ensureOpen();
         if (cardCtrl) {
-          await cardCtrl.update(renderCard(filterForPrefs(state), cardRenderOptions));
+          try {
+            await cardCtrl.update(renderCard(filterForPrefs(state), cardRenderOptions));
+          } catch (err) {
+            cardCtrl = undefined;
+            progressUpdateFailed = true;
+            log.fail('stream', err, { step: 'update' });
+          }
         }
       });
       try {
@@ -1206,14 +1226,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           progress,
           renderDone,
           producerStarted: () => producerStarted,
-          fallback: async (state) => {
-            if (controls.profileConfig.agentKind === 'codex') return;
-            if (renderText(filterForPrefs(state)).trim() === '') return;
-            await channel.send(
-              chatId,
-              { card: renderCard(filterForPrefs(state), cardRenderOptions) },
-              sendOpts,
-            );
+          updateFailed: () => progressUpdateFailed,
+          requireReceipt: Boolean(deps.outbox) && controls.profileConfig.agentKind === 'claude',
+          waitForReceipt: controls.profileConfig.agentKind === 'claude',
+          fallback: async state => {
+            if (controls.profileConfig.agentKind === 'claude') await deliver(finalAnswerOnlyState(state));
           },
         });
       } catch (err) {
@@ -1222,19 +1239,12 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       }
       await recallIfEmptyStreamedReply(channel, progress, filterForPrefs(latestState), scope);
       if (controls.profileConfig.agentKind === 'codex') {
-        await sendFinalReply({
-          channel,
-          chatId,
-          scope,
-          state: finalReplyState(progress, filterForPrefs(latestState)),
-          replyMode,
-          sendOpts,
-          cardRenderOptions,
-        });
+        await deliver(finalReplyState(progress, filterForPrefs(latestState)));
       }
     } else if (replyMode === 'markdown') {
       let latestState: RunState = initialState;
       let producerStarted = false;
+      let progressUpdateFailed = false;
       let markdownCtrl: { setContent(markdown: string): Promise<void> } | undefined;
       const progress = createLazyProgressStream(scope, replyMode, () =>
         channel.stream(
@@ -1255,7 +1265,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         latestState = state;
         if (shouldOpenProgressStream(filterForPrefs(state))) progress.ensureOpen();
         if (markdownCtrl) {
-          await markdownCtrl.setContent(renderText(filterForPrefs(state)));
+          try {
+            await markdownCtrl.setContent(renderText(filterForPrefs(state)));
+          } catch (err) {
+            markdownCtrl = undefined;
+            progressUpdateFailed = true;
+            log.fail('stream', err, { step: 'update' });
+          }
         }
       });
       try {
@@ -1264,12 +1280,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           progress,
           renderDone,
           producerStarted: () => producerStarted,
-          fallback: async (state) => {
-            if (controls.profileConfig.agentKind === 'codex') return;
-            const body = renderText(filterForPrefs(state));
-            if (body.trim()) {
-              await channel.send(chatId, { markdown: body }, sendOpts);
-            }
+          updateFailed: () => progressUpdateFailed,
+          requireReceipt: Boolean(deps.outbox) && controls.profileConfig.agentKind === 'claude',
+          waitForReceipt: controls.profileConfig.agentKind === 'claude',
+          fallback: async state => {
+            if (controls.profileConfig.agentKind === 'claude') await deliver(finalAnswerOnlyState(state));
           },
         });
       } catch (err) {
@@ -1278,33 +1293,15 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       }
       await recallIfEmptyStreamedReply(channel, progress, filterForPrefs(latestState), scope);
       if (controls.profileConfig.agentKind === 'codex') {
-        await sendFinalReply({
-          channel,
-          chatId,
-          scope,
-          state: finalReplyState(progress, filterForPrefs(latestState)),
-          replyMode,
-          sendOpts,
-          cardRenderOptions,
-        });
+        await deliver(finalReplyState(progress, filterForPrefs(latestState)));
       }
     } else {
       // text mode: drain the agent stream without sending anything during
       // the run, then post the final rendered text once as a plain markdown
       // (msg_type=post) message — no card, no streaming, no typewriter.
       const finalState = await renderRun(async () => {});
-      await sendFinalReply({
-        channel,
-        chatId,
-        scope,
-        state:
-          controls.profileConfig.agentKind === 'codex'
-            ? finalAnswerOnlyState(filterForPrefs(finalState))
-            : filterForPrefs(finalState),
-        replyMode,
-        sendOpts,
-        cardRenderOptions,
-      });
+      await deliver(controls.profileConfig.agentKind === 'codex'
+        ? finalAnswerOnlyState(finalState) : filterForPrefs(finalState));
     }
   } catch (err) {
     completed = false;
@@ -1698,10 +1695,18 @@ async function awaitRenderAwareStream(input: {
   progress: LazyProgressStream;
   renderDone: Promise<RunState>;
   producerStarted: () => boolean;
+  waitForReceipt: boolean;
+  requireReceipt: boolean;
+  updateFailed: () => boolean;
   fallback: (state: RunState) => Promise<void>;
 }): Promise<void> {
   const streamResult = input.progress.settled.then(
-    () => ({ kind: 'stream' as const, ok: true as const }),
+    result => {
+      if (input.requireReceipt && !(result as { messageId?: string } | undefined)?.messageId?.trim()) {
+        return { kind: 'stream' as const, ok: false as const, err: new Error('stream missing message receipt') };
+      }
+      return { kind: 'stream' as const, ok: true as const };
+    },
     (err) => ({ kind: 'stream' as const, ok: false as const, err }),
   );
   const renderResult = input.renderDone.then(
@@ -1723,6 +1728,7 @@ async function awaitRenderAwareStream(input: {
   if (first.kind === 'stream') {
     const rendered = await renderResult;
     if (!rendered.ok) throw rendered.err;
+    if (input.updateFailed()) await runFallbackReply(input.mode, rendered.state, input.fallback);
     return;
   }
 
@@ -1750,6 +1756,11 @@ async function awaitRenderAwareStream(input: {
         mode: input.mode,
         graceMs: STREAM_TERMINAL_GRACE_MS,
       });
+      if (input.waitForReceipt) {
+        const late = await streamResult;
+        if (!late.ok || input.updateFailed()) await runFallbackReply(input.mode, first.state, input.fallback);
+        return;
+      }
       void streamResult.then((result) => {
         if (!result.ok) {
           log.fail('stream', result.err, { mode: input.mode, step: 'stream-terminal-late' });
@@ -1766,11 +1777,12 @@ async function awaitRenderAwareStream(input: {
     return;
   }
 
+  if (terminal.ok && input.updateFailed()) await runFallbackReply(input.mode, first.state, input.fallback);
   if (!terminal.ok) {
     // A stream that failed before producing anything delivered nothing, so the
     // reply still has to go out; one that failed later already showed its
     // content and the error is the caller's to handle.
-    if (input.producerStarted()) throw terminal.err;
+    if (input.producerStarted() && !input.waitForReceipt) throw terminal.err;
     log.fail('stream', terminal.err, { mode: input.mode, step: 'stream' });
     await runFallbackReply(input.mode, first.state, input.fallback);
   }
@@ -1785,6 +1797,7 @@ async function runFallbackReply(
     await fallback(state);
   } catch (err) {
     log.fail('stream', err, { mode, step: 'fallback' });
+    throw err;
   }
 }
 
